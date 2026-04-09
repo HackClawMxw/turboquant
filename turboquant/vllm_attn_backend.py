@@ -92,24 +92,9 @@ def enable_no_alloc(
     )
 
     from vllm.v1.executor.abstract import Executor
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
     if hasattr(Executor, "_tq_patched"):
         return
-
-    if not hasattr(GPUModelRunner, "_tq_layout_patch"):
-        orig_layout_update = GPUModelRunner._update_hybrid_attention_mamba_layout
-
-        def patched_layout_update(self, kv_caches):
-            for layer_name, target_layer_name in getattr(
-                self, "shared_kv_cache_layers", {}
-            ).items():
-                if layer_name not in kv_caches and target_layer_name in kv_caches:
-                    kv_caches[layer_name] = kv_caches[target_layer_name]
-            return orig_layout_update(self, kv_caches)
-
-        GPUModelRunner._update_hybrid_attention_mamba_layout = patched_layout_update
-        GPUModelRunner._tq_layout_patch = True
 
     orig_get_specs = Executor.get_kv_cache_specs
 
@@ -132,29 +117,21 @@ def enable_no_alloc(
                 mode=MODE_ACTIVE,
                 no_alloc=True,
             )
-            static_ctx = worker.model_runner.compilation_config.static_forward_context
-            flash_layers = [
-                name
-                for name, state in tq_states.items()
-                if getattr(state, "supports_hybrid", False)
-            ]
-            shared_layers = 0
-            if len(flash_layers) > 1:
-                target = flash_layers[0]
-                target_attn = static_ctx.get(target)
-                if target_attn is not None and hasattr(target_attn, "kv_sharing_target_layer_name"):
-                    target_attn.kv_sharing_target_layer_name = None
-                for name in flash_layers[1:]:
-                    attn = static_ctx.get(name)
-                    if attn is None or not hasattr(attn, "kv_sharing_target_layer_name"):
-                        continue
-                    attn.kv_sharing_target_layer_name = target
-                    shared_layers += 1
 
+            # NOTE: Do NOT set kv_sharing_target_layer_name here.
+            # In vLLM v0.18.0+, Attention.forward() skips calling
+            # do_kv_cache_update when kv_sharing_target_layer_name is set.
+            # Since no_alloc mode relies on patched do_kv_cache_update to
+            # capture KV into the TQ store, sharing would prevent KV capture
+            # for all shared layers, causing garbage output.
+
+            flash_layers = sum(
+                1 for s in tq_states.values()
+                if getattr(s, "supports_hybrid", False)
+            )
             return {
                 "hooks": len(tq_states),
-                "flash_layers": len(flash_layers),
-                "shared_layers": shared_layers,
+                "flash_layers": flash_layers,
             }
 
         try:
