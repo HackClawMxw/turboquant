@@ -27,7 +27,7 @@ import torch.nn.functional as F
 
 from turboquant.capture import KVCaptureEngine
 from turboquant.store import CompressedKVStore
-from turboquant.score import compute_hybrid_attention
+from turboquant.score import compute_hybrid_attention, MIN_HISTORY_FOR_TQ
 
 logger = logging.getLogger("turboquant.integration.vllm")
 
@@ -209,6 +209,7 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         output_block_scale=None,
     ):
         mode = _GLOBAL_MODE
+        
 
         # Capture K/V when no separate kv_update hook exists
         if capture_in_forward and mode not in (MODE_OFF,) and attn_metadata is not None:
@@ -292,6 +293,47 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # Fallback to flash
         if no_alloc:
+            # no_alloc mode: paged cache is not populated, so flash attention
+            # would read garbage. Use TQ attention (compressed + exact recent).
+            flat = state.store.get_flat_cache()
+            has_history = flat is not None and flat.num_tokens >= MIN_HISTORY_FOR_TQ
+            recent = state.engine.ring.peek()
+            has_recent = recent is not None and recent[0].shape[0] > 0
+
+            if has_history or has_recent:
+                num_actual = attn_metadata.num_actual_tokens
+                q = query[:num_actual]
+                if q.dim() == 2:
+                    q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
+
+                recent_k = recent[0] if recent else None
+                recent_v = recent[1] if recent else None
+
+                result = compute_hybrid_attention(
+                    query=q,
+                    store=state.store,
+                    recent_k=recent_k,
+                    recent_v=recent_v,
+                    num_query_heads=state.config.num_query_heads,
+                    scale=getattr(self_impl, "scale", None),
+                )
+
+                result_flat = result.reshape(
+                    num_actual, state.config.num_query_heads * state.config.head_dim
+                ).to(query.dtype)
+
+                if output is not None:
+                    out_slice = output[:num_actual]
+                    if out_slice.dim() == 3:
+                        out_slice.copy_(result.to(out_slice.dtype))
+                    else:
+                        out_slice.copy_(result_flat.to(out_slice.dtype))
+                    return output
+                if query.dim() == 3:
+                    return result.to(query.dtype)
+                return result_flat
+
+            # No KV data at all (very first decode before ring is populated)
             num_actual = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
             if query.dim() == 3:
                 return torch.zeros_like(query[:num_actual])

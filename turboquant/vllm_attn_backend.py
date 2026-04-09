@@ -8,6 +8,7 @@ Kept for backward compatibility with scripts that import from here.
 from __future__ import annotations
 
 import logging
+
 import torch
 
 import turboquant.integration.vllm as _new_backend
@@ -114,9 +115,7 @@ def enable_no_alloc(
 
     def patched_get_kv_cache_specs(self):
         cfg = _TQ_NO_ALLOC_CONFIG
-        with open("/tmp/tq_debug.log", "a") as f:
-            f.write(f"patched_get_kv_cache_specs called pid={os.getpid()} cfg={cfg is not None}\n")
-            f.flush()
+        logger.debug("patched_get_kv_cache_specs called, cfg=%s", cfg is not None)
         if cfg is None:
             return orig_get_specs(self)
 
@@ -160,56 +159,13 @@ def enable_no_alloc(
 
         try:
             hooks = self.collective_rpc(_worker_install_tq)
-            print(f"[TurboQuant] Installed no_alloc hooks: {hooks}", flush=True)
+            logger.info("[TurboQuant] Installed no_alloc hooks: %s", hooks)
         except Exception as e:
-            import traceback
-            print(f"[TurboQuant] collective_rpc FAILED: {e}", flush=True)
-            traceback.print_exc()
+            logger.error("[TurboQuant] collective_rpc FAILED: %s", e, exc_info=True)
         return orig_get_specs(self)
 
     Executor.get_kv_cache_specs = patched_get_kv_cache_specs
     Executor._tq_patched = True
-
-    # Patch the worker's load_model (NOT decorated, so our patch won't be bypassed)
-    try:
-        from vllm.v1.worker.gpu_worker import GPUWorker as WorkerCls
-    except ImportError:
-        try:
-            from vllm.v1.worker.gpu_worker import Worker as WorkerCls
-        except ImportError:
-            WorkerCls = None
-
-    if WorkerCls is not None:
-        orig_worker_load = WorkerCls.load_model
-
-        def patched_worker_load(self_worker):
-            orig_worker_load(self_worker)
-            cfg = _TQ_NO_ALLOC_CONFIG
-            if cfg:
-                try:
-                    import sys
-                    sys.path.insert(0, '/tmp')
-                    from turboquant.vllm_attn_backend import install_turboquant_hooks, MODE_ACCUMULATE
-                    tq = install_turboquant_hooks(
-                        self_worker.model_runner,
-                        key_bits=cfg["key_bits"],
-                        value_bits=cfg["value_bits"],
-                        buffer_size=cfg["buffer_size"],
-                        initial_layers_count=cfg["initial_layers_count"],
-                        mode=MODE_ACCUMULATE,
-                        no_alloc=False,
-                    )
-                    with open("/tmp/tq_debug.log", "a") as f:
-                        f.write(f"TQ hooks: {len(tq)} layers pid={os.getpid()}\n")
-                        f.flush()
-                except Exception as e:
-                    with open("/tmp/tq_debug.log", "a") as f:
-                        import traceback
-                        f.write(f"TQ FAIL pid={os.getpid()}: {e}\n")
-                        traceback.print_exc(file=f)
-                        f.flush()
-
-        WorkerCls.load_model = patched_worker_load
 
     logger.info("[TurboQuant] Patched Executor for auto TQ hook installation")
 
