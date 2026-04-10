@@ -184,16 +184,15 @@ def enable_no_alloc(
 
         specs = orig_get_specs(self)
 
+        # specs is list[dict[str, KVCacheSpec]] — one dict per worker.
         # Remove specs for shared layers so vLLM doesn't allocate KV cache
         # for them — they'll share the target layer's cache instead.
         shared = []
         if hooks and isinstance(hooks, list) and len(hooks) > 0:
             shared = hooks[0].get("shared_layer_names", [])
-        for name in shared:
-            try:
-                specs.pop(name)
-            except KeyError:
-                pass
+        for worker_specs in specs:
+            for name in shared:
+                worker_specs.pop(name, None)
         if shared:
             logger.info(
                 "[TurboQuant] Removed %d shared layer specs from KV cache "
