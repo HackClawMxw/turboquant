@@ -190,7 +190,10 @@ def enable_no_alloc(
         if hooks and isinstance(hooks, list) and len(hooks) > 0:
             shared = hooks[0].get("shared_layer_names", [])
         for name in shared:
-            specs.pop(name, None)
+            try:
+                specs.pop(name)
+            except KeyError:
+                pass
         if shared:
             logger.info(
                 "[TurboQuant] Removed %d shared layer specs from KV cache "
