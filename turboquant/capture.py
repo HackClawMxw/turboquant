@@ -154,6 +154,7 @@ class KVCaptureEngine:
             dtype=dtype,
         )
         self._prefill_done = False
+        self._was_decoding = False
 
     @property
     def total_compressed_tokens(self) -> int:
@@ -172,6 +173,10 @@ class KVCaptureEngine:
 
         key/value: (num_tokens, num_kv_heads, head_dim)
         """
+        if self._was_decoding:
+            # Previous request's decode state is still present — new request starting.
+            self.reset()
+
         if num_tokens <= self.ring.capacity:
             self.ring.write(key[:num_tokens], value[:num_tokens], num_tokens)
         else:
@@ -222,6 +227,7 @@ class KVCaptureEngine:
         Overflow is automatically flushed to the compressed store.
         key/value: (num_tokens, num_kv_heads, head_dim)
         """
+        self._was_decoding = True
         overflow = self.ring.write(key[:num_tokens], value[:num_tokens], num_tokens)
         if overflow is not None:
             k_over, v_over = overflow
@@ -238,3 +244,4 @@ class KVCaptureEngine:
         self.ring.reset()
         self.store.reset()
         self._prefill_done = False
+        self._was_decoding = False
