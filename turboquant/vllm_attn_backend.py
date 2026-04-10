@@ -93,8 +93,34 @@ def enable_no_alloc(
 
     from vllm.v1.executor.abstract import Executor
 
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except ImportError:
+        GPUModelRunner = None
+
     if hasattr(Executor, "_tq_patched"):
         return
+
+    # Patch layout update so shared layers point to the target layer's cache.
+    # Needed for hybrid attention+mamba models where shared layers don't get
+    # their own cache allocated (specs removed).
+    if (
+        GPUModelRunner is not None
+        and not hasattr(GPUModelRunner, "_tq_layout_patch")
+        and hasattr(GPUModelRunner, "_update_hybrid_attention_mamba_layout")
+    ):
+        _orig_layout_update = GPUModelRunner._update_hybrid_attention_mamba_layout
+
+        def _patched_layout_update(self_runner, kv_caches):
+            for layer_name, target_name in getattr(
+                self_runner, "shared_kv_cache_layers", {}
+            ).items():
+                if layer_name not in kv_caches and target_name in kv_caches:
+                    kv_caches[layer_name] = kv_caches[target_name]
+            return _orig_layout_update(self_runner, kv_caches)
+
+        GPUModelRunner._update_hybrid_attention_mamba_layout = _patched_layout_update
+        GPUModelRunner._tq_layout_patch = True
 
     orig_get_specs = Executor.get_kv_cache_specs
 
@@ -118,20 +144,35 @@ def enable_no_alloc(
                 no_alloc=True,
             )
 
-            # NOTE: Do NOT set kv_sharing_target_layer_name here.
-            # In vLLM v0.18.0+, Attention.forward() skips calling
-            # do_kv_cache_update when kv_sharing_target_layer_name is set.
-            # Since no_alloc mode relies on patched do_kv_cache_update to
-            # capture KV into the TQ store, sharing would prevent KV capture
-            # for all shared layers, causing garbage output.
+            # Set up KV sharing so all flash layers share the first layer's
+            # paged cache.  This reduces KV cache allocation from N to 1.
+            # KV capture is done in patched forward (capture_in_forward=True),
+            # so skipping do_kv_cache_update for shared layers is safe.
+            static_ctx = worker.model_runner.compilation_config.static_forward_context
+            flash_layers = [
+                name for name, state in tq_states.items()
+                if getattr(state, "supports_hybrid", False)
+            ]
+            shared_layer_names = []
+            if len(flash_layers) > 1:
+                target = flash_layers[0]
+                target_attn = static_ctx.get(target)
+                if target_attn is not None and hasattr(
+                    target_attn, "kv_sharing_target_layer_name"
+                ):
+                    target_attn.kv_sharing_target_layer_name = None
+                for name in flash_layers[1:]:
+                    attn = static_ctx.get(name)
+                    if attn is not None and hasattr(
+                        attn, "kv_sharing_target_layer_name"
+                    ):
+                        attn.kv_sharing_target_layer_name = target
+                        shared_layer_names.append(name)
 
-            flash_layers = sum(
-                1 for s in tq_states.values()
-                if getattr(s, "supports_hybrid", False)
-            )
             return {
                 "hooks": len(tq_states),
-                "flash_layers": flash_layers,
+                "flash_layers": len(flash_layers),
+                "shared_layer_names": shared_layer_names,
             }
 
         try:
@@ -139,7 +180,24 @@ def enable_no_alloc(
             logger.info("[TurboQuant] Installed no_alloc hooks: %s", hooks)
         except Exception as e:
             logger.error("[TurboQuant] collective_rpc FAILED: %s", e, exc_info=True)
-        return orig_get_specs(self)
+            return orig_get_specs(self)
+
+        specs = orig_get_specs(self)
+
+        # Remove specs for shared layers so vLLM doesn't allocate KV cache
+        # for them — they'll share the target layer's cache instead.
+        shared = []
+        if hooks and isinstance(hooks, list) and len(hooks) > 0:
+            shared = hooks[0].get("shared_layer_names", [])
+        for name in shared:
+            specs.pop(name, None)
+        if shared:
+            logger.info(
+                "[TurboQuant] Removed %d shared layer specs from KV cache "
+                "allocation (layers share one paged cache)", len(shared),
+            )
+
+        return specs
 
     Executor.get_kv_cache_specs = patched_get_kv_cache_specs
     Executor._tq_patched = True

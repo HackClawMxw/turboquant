@@ -124,25 +124,17 @@ def _is_mla_impl(impl) -> bool:
 # Patched methods — kept as thin as possible
 # ---------------------------------------------------------------------------
 
-def _make_patched_kv_update(orig_fn, state: LayerState, no_alloc: bool = False):
-    """Intercept KV cache writes to capture into TQ store."""
+def _make_patched_kv_update(orig_fn, no_alloc: bool = False):
+    """Intercept KV cache writes — skip original when no_alloc.
+
+    KV capture is always done in patched forward to support KV-shared layers
+    where vLLM skips calling do_kv_cache_update entirely.
+    """
 
     def patched(self_impl, layer, key, value, kv_cache, slot_mapping):
         if not no_alloc:
-            # Standard mode: keep paged cache behavior.
             orig_fn(self_impl, layer, key, value, kv_cache, slot_mapping)
-
-        mode = _GLOBAL_MODE
-        if mode == MODE_OFF:
-            return
-
-        num_tokens = slot_mapping.shape[0]
-        if num_tokens <= 1:
-            # Decode token — append to ring buffer
-            state.engine.ingest_decode(key, value, num_tokens)
-        else:
-            # Prefill — bulk capture
-            state.engine.ingest_prefill(key, value, num_tokens)
+        # KV capture handled in patched forward (see capture_in_forward)
 
     return patched
 
@@ -444,29 +436,29 @@ def install_hooks(
 
         if backend_kind == "flash":
             has_separate_kv_update = hasattr(impl, "do_kv_cache_update")
-            needs_forward_capture = not has_separate_kv_update
 
             if has_separate_kv_update:
+                # Patch to skip original paged cache write (no_alloc),
+                # but do NOT capture KV here — always done in forward
+                # to support KV-shared layers where vLLM skips this call.
                 patched_update = _make_patched_kv_update(
-                    impl.do_kv_cache_update.__func__, state, no_alloc=no_alloc
+                    impl.do_kv_cache_update.__func__, no_alloc=no_alloc
                 )
                 impl.do_kv_cache_update = types.MethodType(
                     lambda self, *a, _p=patched_update, **kw: _p(self, *a, **kw), impl
                 )
 
+            # Always capture KV in forward. For KV-shared layers,
+            # do_kv_cache_update is never called by vLLM, so forward
+            # is the only place to capture.
             patched_forward = _make_patched_forward(
                 impl.forward.__func__, state, no_alloc=no_alloc,
-                capture_in_forward=needs_forward_capture,
+                capture_in_forward=True,
             )
             impl.forward = types.MethodType(
                 lambda self, *a, _p=patched_forward, **kw: _p(self, *a, **kw), impl
             )
 
-            if needs_forward_capture and layer_idx == 0:
-                logger.info(
-                    "[TurboQuant] No do_kv_cache_update found (vLLM 0.16 FlashInfer); "
-                    "capturing K/V in forward()"
-                )
         else:
             if hasattr(impl, "do_kv_cache_update"):
                 patched_update = _make_patched_mla_update(impl.do_kv_cache_update.__func__, state)
