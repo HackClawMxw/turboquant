@@ -28,7 +28,7 @@ import torch.nn.functional as F
 
 from turboquant.capture import KVCaptureEngine
 from turboquant.store import CompressedKVStore
-from turboquant.score import compute_hybrid_attention, MIN_HISTORY_FOR_TQ
+from turboquant.score import compute_hybrid_attention, MIN_HISTORY_FOR_TQ, preallocate_layer
 
 logger = logging.getLogger("turboquant.integration.vllm")
 
@@ -214,6 +214,11 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
             torch.cuda.synchronize()
             t_total_0 = time.perf_counter()
 
+        # Prefill-to-decode transition: compress prefill ring buffer
+        # into the store and reset device tensors for graph mode.
+        if is_decode and not state.engine._was_decoding:
+            state.engine.prepare_for_decode()
+
         # Capture K/V when no separate kv_update hook exists
         if capture_in_forward and mode not in (MODE_OFF,) and attn_metadata is not None:
             _capture_kv(key, value, attn_metadata)
@@ -290,9 +295,16 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 if q.dim() == 2:
                     q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
 
-                recent = state.engine.ring.peek()
-                recent_k = recent[0] if recent else None
-                recent_v = recent[1] if recent else None
+                # In CUDA-Graph mode, use full ring buffer (masking handled
+                # in score.py's _hybrid_graph via device count tensor).
+                # In eager mode, use Python-sliced peek().
+                if state.engine.ring.graph_ready:
+                    recent_k = state.engine.ring._k
+                    recent_v = state.engine.ring._v
+                else:
+                    recent = state.engine.ring.peek()
+                    recent_k = recent[0] if recent else None
+                    recent_v = recent[1] if recent else None
 
                 if should_log:
                     torch.cuda.synchronize()
@@ -305,6 +317,7 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                     recent_v=recent_v,
                     num_query_heads=state.config.num_query_heads,
                     scale=getattr(self_impl, "scale", None),
+                    layer_state=state,
                 )
 
                 if should_log:
@@ -347,17 +360,23 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
             # would read garbage. Use TQ attention (compressed + exact recent).
             flat = state.store.get_flat_cache()
             has_history = flat is not None and flat.num_tokens >= MIN_HISTORY_FOR_TQ
-            recent = state.engine.ring.peek()
-            has_recent = recent is not None and recent[0].shape[0] > 0
+
+            # In graph mode, ring buffer is always non-empty after write_graph
+            if state.engine.ring.graph_ready:
+                has_recent = True
+                recent_k = state.engine.ring._k
+                recent_v = state.engine.ring._v
+            else:
+                recent = state.engine.ring.peek()
+                has_recent = recent is not None and recent[0].shape[0] > 0
+                recent_k = recent[0] if recent else None
+                recent_v = recent[1] if recent else None
 
             if has_history or has_recent:
                 num_actual = attn_metadata.num_actual_tokens
                 q = query[:num_actual]
                 if q.dim() == 2:
                     q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
-
-                recent_k = recent[0] if recent else None
-                recent_v = recent[1] if recent else None
 
                 result = compute_hybrid_attention(
                     query=q,
@@ -366,6 +385,7 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                     recent_v=recent_v,
                     num_query_heads=state.config.num_query_heads,
                     scale=getattr(self_impl, "scale", None),
+                    layer_state=state,
                 )
 
                 result_flat = result.reshape(
@@ -567,6 +587,54 @@ def install_hooks(
         f"[TurboQuant] Hooks on {len(layer_states)} layers "
         f"(mode={mode}, no_alloc={no_alloc})"
     )
+
+    # Pre-allocate CUDA-Graph-compatible buffers.
+    # Derive max_tokens from the model's scheduling config.
+    max_tokens = 0
+    try:
+        scheduler_config = getattr(model_runner, 'scheduler_config', None)
+        if scheduler_config is not None:
+            max_tokens = getattr(scheduler_config, 'max_num_seqs', 0) * getattr(
+                scheduler_config, 'max_model_len', 0
+            )
+            # Use max_model_len as a generous upper bound per sequence
+            max_tokens = getattr(scheduler_config, 'max_model_len', 0)
+    except Exception:
+        pass
+
+    if max_tokens > 0:
+        for name, state in layer_states.items():
+            if state.supports_hybrid:
+                try:
+                    preallocate_layer(state, max_tokens)
+                except Exception as e:
+                    logger.warning(
+                        "[TurboQuant] Pre-allocation failed for %s: %s", name, e
+                    )
+
+    # Patch model runner to detect ring buffer overflow and compress
+    # between CUDA Graph replays.  This Python hook runs after every
+    # execute_model call; the overhead is negligible (CPU counter check).
+    _tq_states_ref = layer_states
+    _orig_execute_model = getattr(model_runner, 'execute_model', None)
+    if _orig_execute_model is not None and not getattr(model_runner, '_tq_execute_patched', False):
+        def _make_tq_execute_hook(orig_fn, states):
+            def hooked(*args, **kwargs):
+                result = orig_fn(*args, **kwargs)
+                # Check TQ ring buffer overflow for all graph-ready layers
+                for _name, st in states.items():
+                    ring = st.engine.ring
+                    if ring._graph_mode:
+                        ring._cpu_decode_steps += 1
+                        st.engine.check_overflow_and_compress()
+                return result
+            return hooked
+
+        model_runner.execute_model = _make_tq_execute_hook(
+            _orig_execute_model, _tq_states_ref,
+        )
+        model_runner._tq_execute_patched = True
+        logger.info("[TurboQuant] Patched model_runner.execute_model for overflow check")
 
     # Diagnostic init log
     n_flash = sum(1 for s in layer_states.values() if s.config.backend_kind == "flash")

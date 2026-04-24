@@ -23,6 +23,13 @@ class RingBuffer:
 
     Stores the most recent ``capacity`` tokens in bf16/fp16.
     When full, the oldest chunk is returned for compression.
+
+    CUDA-Graph mode:
+      When ``preallocate_graph_buffers()`` is called, the ring buffer uses
+      device-side int32 tensors for position and count.  All write/read
+      operations are pure CUDA ops (index_copy_, add_, remainder_, etc.)
+      so they can be captured and replayed by CUDA Graph without any
+      Python involvement.
     """
 
     __slots__ = (
@@ -35,6 +42,13 @@ class RingBuffer:
         "_v",
         "_pos",
         "_total_written",
+        # CUDA-Graph device tensors (set by preallocate_graph_buffers)
+        "_pos_tensor",
+        "_count_tensor",
+        "_capacity_tensor",
+        "_arange_buf",
+        "_cpu_decode_steps",
+        "_graph_mode",
     )
 
     def __init__(
@@ -59,6 +73,14 @@ class RingBuffer:
         )
         self._pos = 0
         self._total_written = 0
+
+        # CUDA-Graph device tensors (initialised lazily)
+        self._pos_tensor = None
+        self._count_tensor = None
+        self._capacity_tensor = None
+        self._arange_buf = None
+        self._cpu_decode_steps = 0
+        self._graph_mode = False
 
     @property
     def size(self) -> int:
@@ -129,6 +151,82 @@ class RingBuffer:
     def reset(self):
         self._pos = 0
         self._total_written = 0
+        self._cpu_decode_steps = 0
+        if self._graph_mode:
+            self._pos_tensor.fill_(0)
+            self._count_tensor.fill_(0)
+
+    # ------------------------------------------------------------------
+    # CUDA-Graph-compatible methods
+    # ------------------------------------------------------------------
+
+    def preallocate_graph_buffers(self):
+        """Initialise device tensors for CUDA-Graph-compatible operation.
+
+        Call once during model initialisation, before any CUDA Graph capture.
+        """
+        self._pos_tensor = torch.zeros(1, device=self.device, dtype=torch.int32)
+        self._count_tensor = torch.zeros(1, device=self.device, dtype=torch.int32)
+        self._capacity_tensor = torch.tensor(
+            [self.capacity], device=self.device, dtype=torch.int32,
+        )
+        self._arange_buf = torch.arange(
+            self.capacity, device=self.device, dtype=torch.int32,
+        )
+        self._graph_mode = True
+
+    @property
+    def graph_ready(self) -> bool:
+        return self._graph_mode
+
+    def write_graph(self, key: torch.Tensor, value: torch.Tensor):
+        """CUDA-Graph-compatible write for a single decode token.
+
+        All operations are in-place CUDA ops on fixed-address tensors:
+          1. index_copy_ writes K/V at current device-side position
+          2. Position increments with wrap-around (remainder_)
+          3. Count increments and clamps to capacity
+
+        key/value: (1, num_kv_heads, head_dim) or (num_kv_heads, head_dim)
+        """
+        if key.dim() == 2:
+            key = key.unsqueeze(0)
+            value = value.unsqueeze(0)
+
+        # Write K/V at current position
+        self._k.index_copy_(0, self._pos_tensor, key)
+        self._v.index_copy_(0, self._pos_tensor, value)
+
+        # Advance position (wrap around at capacity)
+        self._pos_tensor.add_(1)
+        self._pos_tensor.remainder_(self._capacity_tensor)
+
+        # Advance and clamp count
+        self._count_tensor.add_(1)
+        self._count_tensor.minimum_(self._capacity_tensor)
+
+    def peek_full(self):
+        """Return full ring buffer + device count for CUDA-Graph-compatible read.
+
+        Returns:
+            (ring_k, ring_v, count_tensor, arange_buf, capacity_tensor)
+            - ring_k: (capacity, H, D) — full buffer
+            - ring_v: (capacity, H, D) — full buffer
+            - count_tensor: (1,) int32 — number of valid entries
+            - arange_buf: (capacity,) int32 — for masking
+            - capacity_tensor: (1,) int32 — ring buffer capacity
+        """
+        return self._k, self._v, self._count_tensor, self._arange_buf, self._capacity_tensor
+
+    def is_full_for_graph(self) -> bool:
+        """CPU-side check: has the ring buffer filled up since last compression?"""
+        return self._cpu_decode_steps >= self.capacity
+
+    def reset_for_graph(self):
+        """Reset device tensors after compression (called between graph replays)."""
+        self._pos_tensor.fill_(0)
+        self._count_tensor.fill_(0)
+        self._cpu_decode_steps = 0
 
 
 class KVCaptureEngine:
@@ -228,10 +326,44 @@ class KVCaptureEngine:
         key/value: (num_tokens, num_kv_heads, head_dim)
         """
         self._was_decoding = True
-        overflow = self.ring.write(key[:num_tokens], value[:num_tokens], num_tokens)
-        if overflow is not None:
-            k_over, v_over = overflow
-            self.store.append_chunk(k_over, v_over)
+        if self.ring._graph_mode and num_tokens == 1:
+            # CUDA-Graph-compatible path: single-token device-tensor write
+            self.ring.write_graph(key[:1], value[:1])
+        else:
+            overflow = self.ring.write(key[:num_tokens], value[:num_tokens], num_tokens)
+            if overflow is not None:
+                k_over, v_over = overflow
+                self.store.append_chunk(k_over, v_over)
+
+    def prepare_for_decode(self):
+        """Compress prefill ring buffer data before entering decode / graph mode.
+
+        Called once at the prefill-to-decode transition.  Drains the ring
+        buffer into the compressed store and resets device-side counters.
+        """
+        data = self.ring.drain()
+        if data is not None:
+            k, v = data
+            self.store.append_chunk(k, v)
+        if self.ring._graph_mode:
+            self.ring.reset_for_graph()
+
+    def check_overflow_and_compress(self):
+        """Check if the ring buffer has filled up and compress if needed.
+
+        Called between CUDA Graph replays (from the model runner hook).
+        Uses CPU-side tracking — no CUDA sync required.
+        """
+        if not self.ring._graph_mode:
+            return
+        if not self.ring.is_full_for_graph():
+            return
+
+        # Clone ring buffer and compress into store
+        k = self.ring._k.clone()
+        v = self.ring._v.clone()
+        self.store.append_chunk(k, v)
+        self.ring.reset_for_graph()
 
     def flush(self):
         """Force-flush ring buffer to compressed store."""

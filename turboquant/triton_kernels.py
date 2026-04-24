@@ -605,3 +605,754 @@ def turboquant_fused_decode(
     )
 
     return out.to(query.dtype)
+
+
+# ─── GQA-aware score kernels ──────────────────────────────────────────
+#
+# For GQA models, num_query_heads > num_kv_heads.  Each KV head serves
+# G = num_query_heads / num_kv_heads query heads.  These kernels map each
+# query head to its KV head via:  kv_head = query_head // GQA_RATIO
+#
+# This avoids expanding / duplicating KV data (which would waste memory)
+# and lets each query head share the same compressed KV read.
+
+
+@triton.jit
+def _turboquant_mse_score_gqa_kernel(
+    # Pointers
+    Q_ptr,
+    MSE_ptr,
+    NORMS_ptr,
+    CENTROIDS_ptr,
+    OUT_ptr,
+    # Strides
+    stride_q_qh, stride_q_d,
+    stride_m_kv, stride_m_n, stride_m_d,
+    stride_n_kv, stride_n_n,
+    stride_o_qh, stride_o_n,
+    # Dimensions
+    QH: tl.constexpr,
+    N,
+    D: tl.constexpr,
+    PACKED_D: tl.constexpr,
+    # Quantization params
+    BITS: tl.constexpr,
+    VALS_PER_BYTE: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+    # Block
+    BLOCK_N: tl.constexpr,
+):
+    """GQA-aware MSE score: each query head maps to its KV head."""
+    pid_q = tl.program_id(0)   # query head index
+    pid_n = tl.program_id(1)   # KV token block index
+    pid_kv = pid_q // GQA_RATIO  # KV head index
+
+    n_start = pid_n * BLOCK_N
+    n_offs = n_start + tl.arange(0, BLOCK_N)
+    n_mask = n_offs < N
+
+    # Load the full rotated query vector once into registers
+    d_offs = tl.arange(0, D)
+    q = tl.load(Q_ptr + pid_q * stride_q_qh + d_offs * stride_q_d).to(tl.float32)
+
+    scores = tl.zeros([BLOCK_N], dtype=tl.float32)
+    BIT_MASK: tl.constexpr = (1 << BITS) - 1
+
+    for byte_idx in range(PACKED_D):
+        packed = tl.load(
+            MSE_ptr + pid_kv * stride_m_kv + n_offs * stride_m_n + byte_idx * stride_m_d,
+            mask=n_mask, other=0,
+        ).to(tl.int32)
+        for sub in range(VALS_PER_BYTE):
+            coord_idx = byte_idx * VALS_PER_BYTE + sub
+            if coord_idx < D:
+                idx = (packed >> (sub * BITS)) & BIT_MASK
+                centroid_val = tl.load(CENTROIDS_ptr + idx)
+                scores += q[coord_idx] * centroid_val
+
+    norms = tl.load(
+        NORMS_ptr + pid_kv * stride_n_kv + n_offs * stride_n_n,
+        mask=n_mask, other=0.0,
+    ).to(tl.float32)
+    scores = scores * norms
+
+    tl.store(
+        OUT_ptr + pid_q * stride_o_qh + n_offs * stride_o_n,
+        scores, mask=n_mask,
+    )
+
+
+@triton.jit
+def _turboquant_qjl_score_gqa_kernel(
+    Q_SKETCH_ptr,
+    SIGNS_ptr,
+    RES_NORMS_ptr,
+    OUT_ptr,
+    # Strides
+    stride_qs_qh, stride_qs_d,
+    stride_s_kv, stride_s_n, stride_s_d,
+    stride_rn_kv, stride_rn_n,
+    stride_o_qh, stride_o_n,
+    # Dims
+    N,
+    D: tl.constexpr,
+    PACKED_D_SIGNS: tl.constexpr,
+    QJL_SCALE,
+    GQA_RATIO: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """GQA-aware QJL score: adds QJL contribution in-place."""
+    pid_q = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_kv = pid_q // GQA_RATIO
+
+    n_start = pid_n * BLOCK_N
+    n_offs = n_start + tl.arange(0, BLOCK_N)
+    n_mask = n_offs < N
+
+    # Load sketched query once into registers
+    d_offs = tl.arange(0, D)
+    q_s = tl.load(Q_SKETCH_ptr + pid_q * stride_qs_qh + d_offs * stride_qs_d).to(tl.float32)
+
+    dot = tl.zeros([BLOCK_N], dtype=tl.float32)
+
+    for byte_idx in range(PACKED_D_SIGNS):
+        packed = tl.load(
+            SIGNS_ptr + pid_kv * stride_s_kv + n_offs * stride_s_n + byte_idx * stride_s_d,
+            mask=n_mask, other=0,
+        ).to(tl.int32)
+        for bit in range(8):
+            coord_idx = byte_idx * 8 + bit
+            if coord_idx < D:
+                sign_bit = (packed >> bit) & 1
+                sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
+                dot += q_s[coord_idx] * sign_val
+
+    res_norms = tl.load(
+        RES_NORMS_ptr + pid_kv * stride_rn_kv + n_offs * stride_rn_n,
+        mask=n_mask, other=0.0,
+    ).to(tl.float32)
+    qjl_scores = dot * res_norms * QJL_SCALE
+
+    existing = tl.load(
+        OUT_ptr + pid_q * stride_o_qh + n_offs * stride_o_n,
+        mask=n_mask, other=0.0,
+    )
+    tl.store(
+        OUT_ptr + pid_q * stride_o_qh + n_offs * stride_o_n,
+        existing + qjl_scores, mask=n_mask,
+    )
+
+
+def turboquant_scores_gqa(
+    query: torch.Tensor,
+    mse_packed: torch.Tensor,
+    qjl_signs: torch.Tensor,
+    norms: torch.Tensor,
+    res_norms: torch.Tensor,
+    centroids: torch.Tensor,
+    Pi: torch.Tensor,
+    S: torch.Tensor,
+    mse_bits: int,
+    qjl_scale: float,
+    gqa_ratio: int,
+) -> torch.Tensor:
+    """Compute TQ attention scores with GQA support via Triton kernels.
+
+    Avoids materializing dequantized K — scores are computed directly from
+    packed / compressed data.  Uses kv_head indirection for GQA so that
+    compressed KV data is read exactly once per KV head (not per query head).
+
+    Args:
+        query:       (num_query_heads, D) or (num_query_heads, 1, D) — raw query
+        mse_packed:  (H_kv, N, packed_d) uint8  bit-packed MSE indices
+        qjl_signs:   (H_kv, N, packed_d_signs) uint8  packed sign bits
+        norms:       (H_kv, N) float  key L2 norms
+        res_norms:   (H_kv, N) float  residual L2 norms
+        centroids:   (n_clusters,) float32  codebook
+        Pi:          (D, D) float32  rotation matrix
+        S:           (D, D) float32  QJL projection matrix
+        mse_bits:    bits per MSE index
+        qjl_scale:   sqrt(pi/2) / D
+        gqa_ratio:   num_query_heads / num_kv_heads
+
+    Returns:
+        scores: (num_query_heads, N) raw logits (before 1/sqrt(d) scaling).
+    """
+    if query.dim() == 3:
+        query = query.squeeze(1)  # (QH, D)
+
+    QH, D = query.shape
+    N = mse_packed.shape[1]
+    packed_d = mse_packed.shape[2]
+    packed_d_signs = qjl_signs.shape[2]
+    eff_bits, vals_per_byte = _get_packing_params(mse_bits)
+
+    # One-time matmuls: rotate & sketch the query (cheap, QH × D × D)
+    q_rot = torch.matmul(query.float(), Pi.T)    # (QH, D)
+    q_sketch = torch.matmul(query.float(), S.T)  # (QH, D)
+
+    scores = torch.zeros(QH, N, device=query.device, dtype=torch.float32)
+
+    BLOCK_N = min(128, triton.next_power_of_2(N))
+    grid = (QH, triton.cdiv(N, BLOCK_N))
+
+    _turboquant_mse_score_gqa_kernel[grid](
+        q_rot, mse_packed, norms, centroids, scores,
+        q_rot.stride(0), q_rot.stride(1),
+        mse_packed.stride(0), mse_packed.stride(1), mse_packed.stride(2),
+        norms.stride(0), norms.stride(1),
+        scores.stride(0), scores.stride(1),
+        QH=QH, N=N, D=D, PACKED_D=packed_d,
+        BITS=eff_bits, VALS_PER_BYTE=vals_per_byte,
+        GQA_RATIO=gqa_ratio,
+        BLOCK_N=BLOCK_N,
+    )
+
+    _turboquant_qjl_score_gqa_kernel[grid](
+        q_sketch, qjl_signs, res_norms, scores,
+        q_sketch.stride(0), q_sketch.stride(1),
+        qjl_signs.stride(0), qjl_signs.stride(1), qjl_signs.stride(2),
+        res_norms.stride(0), res_norms.stride(1),
+        scores.stride(0), scores.stride(1),
+        N=N, D=D, PACKED_D_SIGNS=packed_d_signs,
+        QJL_SCALE=qjl_scale,
+        GQA_RATIO=gqa_ratio,
+        BLOCK_N=BLOCK_N,
+    )
+
+    return scores
+
+
+# ─── GQA-aware Fused Decode Kernel ────────────────────────────────────
+#
+# Single-pass kernel: TQ scores + online softmax + value dequant +
+# weighted-sum — one kernel per query head.  Never materialises the full
+# (N, D) dequantized K/V tensors.
+#
+# Returns UNNORMALISED (acc, m, l) so the caller can merge with a recent
+# buffer segment before normalising.
+#
+# GQA: pid_kv = pid_q // GQA_RATIO
+
+
+@triton.jit
+def _turboquant_fused_decode_gqa_kernel(
+    # Query (pre-rotated / pre-sketched)
+    Q_ROT_ptr,
+    Q_SKETCH_ptr,
+    # Quantized keys
+    MSE_ptr,
+    SIGNS_ptr,
+    NORMS_ptr,
+    RES_NORMS_ptr,
+    CENTROIDS_ptr,
+    # Values (group-quantized, unpacked to per-element uint8)
+    V_DATA_ptr,
+    V_SCALES_ptr,
+    V_ZEROS_ptr,
+    # Outputs: unnormalised accumulator, running max, running sum
+    OUT_ptr,
+    M_OUT_ptr,
+    L_OUT_ptr,
+    # --- strides ---
+    stride_q_qh, stride_q_d,
+    stride_m_kv, stride_m_n, stride_m_d,
+    stride_s_kv, stride_s_n, stride_s_d,
+    stride_n_kv, stride_n_n,
+    stride_rn_kv, stride_rn_n,
+    stride_v_kv, stride_v_n, stride_v_d,
+    stride_vs_kv, stride_vs_n, stride_vs_g,
+    stride_vz_kv, stride_vz_n, stride_vz_g,
+    stride_o_qh, stride_o_d,
+    stride_m_qh,
+    stride_l_qh,
+    # --- dims ---
+    N,
+    D: tl.constexpr,
+    PACKED_D_MSE: tl.constexpr,
+    PACKED_D_SIGNS: tl.constexpr,
+    N_GROUPS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    # --- quant params ---
+    BITS: tl.constexpr,
+    VALS_PER_BYTE: tl.constexpr,
+    QJL_SCALE,
+    SM_SCALE,
+    GQA_RATIO: tl.constexpr,
+    # --- block ---
+    BLOCK_N: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_kv = pid_q // GQA_RATIO
+
+    BIT_MASK: tl.constexpr = (1 << BITS) - 1
+
+    # Load query vectors once into registers
+    d_offs = tl.arange(0, D)
+    q_rot = tl.load(Q_ROT_ptr + pid_q * stride_q_qh + d_offs * stride_q_d).to(tl.float32)
+    q_sketch = tl.load(Q_SKETCH_ptr + pid_q * stride_q_qh + d_offs * stride_q_d).to(tl.float32)
+
+    # Online softmax state
+    m_i = tl.zeros([1], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([1], dtype=tl.float32)
+    acc = tl.zeros([D], dtype=tl.float32)
+
+    for block_idx in range(tl.cdiv(N, BLOCK_N)):
+        n_start = block_idx * BLOCK_N
+        n_offs = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offs < N
+
+        # ── MSE score ──
+        mse_scores = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for byte_idx in range(PACKED_D_MSE):
+            packed = tl.load(
+                MSE_ptr + pid_kv * stride_m_kv + n_offs * stride_m_n + byte_idx * stride_m_d,
+                mask=n_mask, other=0,
+            ).to(tl.int32)
+            for sub in range(VALS_PER_BYTE):
+                coord_idx = byte_idx * VALS_PER_BYTE + sub
+                if coord_idx < D:
+                    idx = (packed >> (sub * BITS)) & BIT_MASK
+                    centroid_val = tl.load(CENTROIDS_ptr + idx)
+                    mse_scores += q_rot[coord_idx] * centroid_val
+
+        key_norms = tl.load(
+            NORMS_ptr + pid_kv * stride_n_kv + n_offs * stride_n_n,
+            mask=n_mask, other=0.0,
+        ).to(tl.float32)
+        mse_scores = mse_scores * key_norms
+
+        # ── QJL score ──
+        qjl_dot = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for byte_idx in range(PACKED_D_SIGNS):
+            packed = tl.load(
+                SIGNS_ptr + pid_kv * stride_s_kv + n_offs * stride_s_n + byte_idx * stride_s_d,
+                mask=n_mask, other=0,
+            ).to(tl.int32)
+            for bit in range(8):
+                coord_idx = byte_idx * 8 + bit
+                if coord_idx < D:
+                    sign_bit = (packed >> bit) & 1
+                    sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
+                    qjl_dot += q_sketch[coord_idx] * sign_val
+
+        res_norms = tl.load(
+            RES_NORMS_ptr + pid_kv * stride_rn_kv + n_offs * stride_rn_n,
+            mask=n_mask, other=0.0,
+        ).to(tl.float32)
+        qjl_scores = qjl_dot * res_norms * QJL_SCALE
+
+        # Combined score
+        scores = (mse_scores + qjl_scores) * SM_SCALE
+        scores = tl.where(n_mask, scores, float("-inf"))
+
+        # ── Online softmax update ──
+        m_new = tl.maximum(m_i, tl.max(scores, 0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new)
+        l_i = l_i * alpha + tl.sum(p, 0)
+        acc = acc * alpha
+
+        # ── Value dequantize + accumulate ──
+        v_quant = tl.load(
+            V_DATA_ptr + pid_kv * stride_v_kv
+            + n_offs[:, None] * stride_v_n + d_offs[None, :] * stride_v_d,
+            mask=n_mask[:, None], other=0,
+        ).to(tl.float32)
+        g_offs = d_offs // GROUP_SIZE
+        v_scale = tl.load(
+            V_SCALES_ptr + pid_kv * stride_vs_kv
+            + n_offs[:, None] * stride_vs_n + g_offs[None, :] * stride_vs_g,
+            mask=n_mask[:, None], other=1.0,
+        ).to(tl.float32)
+        v_zero = tl.load(
+            V_ZEROS_ptr + pid_kv * stride_vz_kv
+            + n_offs[:, None] * stride_vz_n + g_offs[None, :] * stride_vz_g,
+            mask=n_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        v_dequant = v_quant * v_scale + v_zero
+        acc += tl.sum(p[:, None] * v_dequant, 0)
+
+        m_i = m_new
+
+    # Store unnormalised output + softmax state
+    tl.store(OUT_ptr + pid_q * stride_o_qh + d_offs * stride_o_d, acc)
+    tl.store(M_OUT_ptr + pid_q * stride_m_qh, m_i)
+    tl.store(L_OUT_ptr + pid_q * stride_l_qh, l_i)
+
+
+def turboquant_fused_decode_gqa(
+    query: torch.Tensor,
+    quantized_key,
+    value_quantized,
+    Pi: torch.Tensor,
+    S: torch.Tensor,
+    centroids: torch.Tensor,
+    mse_bits: int,
+    qjl_scale: float,
+    sm_scale: float,
+    gqa_ratio: int,
+    group_size: int = 32,
+):
+    """Fully fused decode attention with GQA support.
+
+    Single kernel per query head: scores + online softmax + value aggregation.
+    Reads compressed KV directly — never materialises dequantized K/V tensors.
+
+    Returns:
+        acc: (QH, D) unnormalised weighted-sum
+        m:   (QH,)   running max of scaled scores
+        l:   (QH,)   running sum of exponentials
+    """
+    if query.dim() == 3:
+        query = query.squeeze(1)
+    QH, D = query.shape
+
+    # Precompute rotated & sketched queries (two small matmuls)
+    q_rot = torch.matmul(query.float(), Pi.T)    # (QH, D)
+    q_sketch = torch.matmul(query.float(), S.T)  # (QH, D)
+
+    # Flatten quantized key batch dims
+    mse_packed = quantized_key.mse_indices
+    qjl_signs = quantized_key.qjl_signs
+    norms = quantized_key.norms
+    res_norms = quantized_key.residual_norms
+
+    if mse_packed.dim() > 3:
+        BH_actual = mse_packed.shape[0] * mse_packed.shape[1]
+        mse_packed = mse_packed.reshape(BH_actual, *mse_packed.shape[2:])
+        qjl_signs = qjl_signs.reshape(BH_actual, *qjl_signs.shape[2:])
+        norms = norms.reshape(BH_actual, -1)
+        res_norms = res_norms.reshape(BH_actual, -1)
+
+    N = mse_packed.shape[1]
+    packed_d_mse = mse_packed.shape[2]
+    packed_d_signs = qjl_signs.shape[2]
+
+    # Unpack bit-packed values to per-element uint8
+    v_data = value_quantized.data
+    v_scales = value_quantized.scales
+    v_zeros = value_quantized.zeros
+    v_bits = value_quantized.bits if len(value_quantized) > 3 else 2
+    if v_bits == 2 and v_data.shape[-1] != D:
+        from turboquant.kv_cache import unpack_values
+        v_data = unpack_values(value_quantized)
+    elif v_bits == 4 and v_data.shape[-1] != D:
+        from turboquant.kv_cache import unpack_values
+        v_data = unpack_values(value_quantized)
+
+    if v_data.dim() > 3:
+        H_kv = mse_packed.shape[0]
+        v_data = v_data.reshape(H_kv, N, -1)
+        v_scales = v_scales.reshape(H_kv, N, -1)
+        v_zeros = v_zeros.reshape(H_kv, N, -1)
+
+    N_GROUPS = D // group_size
+    eff_bits, vals_per_byte = _get_packing_params(mse_bits)
+
+    # Output tensors
+    acc = torch.zeros(QH, D, device=query.device, dtype=torch.float32)
+    m_out = torch.zeros(QH, device=query.device, dtype=torch.float32)
+    l_out = torch.zeros(QH, device=query.device, dtype=torch.float32)
+
+    BLOCK_N = min(64, triton.next_power_of_2(N))
+    grid = (QH,)
+
+    _turboquant_fused_decode_gqa_kernel[grid](
+        q_rot, q_sketch,
+        mse_packed, qjl_signs, norms, res_norms, centroids,
+        v_data, v_scales, v_zeros,
+        acc, m_out, l_out,
+        # Q strides (same for q_rot and q_sketch — both contiguous)
+        q_rot.stride(0), q_rot.stride(1),
+        # MSE strides
+        mse_packed.stride(0), mse_packed.stride(1), mse_packed.stride(2),
+        # Signs strides
+        qjl_signs.stride(0), qjl_signs.stride(1), qjl_signs.stride(2),
+        # Norms strides
+        norms.stride(0), norms.stride(1),
+        # Res norms strides
+        res_norms.stride(0), res_norms.stride(1),
+        # Value strides
+        v_data.stride(0), v_data.stride(1), v_data.stride(2),
+        v_scales.stride(0), v_scales.stride(1), v_scales.stride(2),
+        v_zeros.stride(0), v_zeros.stride(1), v_zeros.stride(2),
+        # Output strides
+        acc.stride(0), acc.stride(1),
+        m_out.stride(0),
+        l_out.stride(0),
+        # Dims
+        N=N, D=D, PACKED_D_MSE=packed_d_mse, PACKED_D_SIGNS=packed_d_signs,
+        N_GROUPS=N_GROUPS, GROUP_SIZE=group_size,
+        # Quant params
+        BITS=eff_bits, VALS_PER_BYTE=vals_per_byte,
+        QJL_SCALE=qjl_scale, SM_SCALE=sm_scale,
+        GQA_RATIO=gqa_ratio,
+        # Block
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
+
+    return acc, m_out, l_out
+
+
+# ─── CUDA-Graph-compatible Fused Kernel ─────────────────────────────
+#
+# Reads N from a device int32 pointer at runtime (while loop), so the
+# graph replay uses the current N without recapture.  All input/output
+# tensors must be pre-allocated at fixed addresses.
+
+
+@triton.jit
+def _turboquant_fused_decode_graph_kernel(
+    Q_ROT_ptr,
+    Q_SKETCH_ptr,
+    MSE_ptr,
+    SIGNS_ptr,
+    NORMS_ptr,
+    RES_NORMS_ptr,
+    CENTROIDS_ptr,
+    V_DATA_ptr,
+    V_SCALES_ptr,
+    V_ZEROS_ptr,
+    OUT_ptr,
+    M_OUT_ptr,
+    L_OUT_ptr,
+    N_PTR,
+    # --- strides ---
+    stride_q_qh, stride_q_d,
+    stride_m_kv, stride_m_n, stride_m_d,
+    stride_s_kv, stride_s_n, stride_s_d,
+    stride_n_kv, stride_n_n,
+    stride_rn_kv, stride_rn_n,
+    stride_v_kv, stride_v_n, stride_v_d,
+    stride_vs_kv, stride_vs_n, stride_vs_g,
+    stride_vz_kv, stride_vz_n, stride_vz_g,
+    stride_o_qh, stride_o_d,
+    stride_m_qh,
+    stride_l_qh,
+    # --- constexpr dims ---
+    D: tl.constexpr,
+    PACKED_D_MSE: tl.constexpr,
+    PACKED_D_SIGNS: tl.constexpr,
+    N_GROUPS: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    BITS: tl.constexpr,
+    VALS_PER_BYTE: tl.constexpr,
+    QJL_SCALE,
+    SM_SCALE,
+    GQA_RATIO: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    pid_kv = pid_q // GQA_RATIO
+
+    BIT_MASK: tl.constexpr = (1 << BITS) - 1
+
+    # Read N dynamically from device memory
+    N = tl.load(N_PTR).to(tl.int32)
+
+    # Load query vectors once into registers
+    d_offs = tl.arange(0, D)
+    q_rot = tl.load(Q_ROT_ptr + pid_q * stride_q_qh + d_offs * stride_q_d).to(tl.float32)
+    q_sketch = tl.load(Q_SKETCH_ptr + pid_q * stride_q_qh + d_offs * stride_q_d).to(tl.float32)
+
+    m_i = tl.zeros([1], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([1], dtype=tl.float32)
+    acc = tl.zeros([D], dtype=tl.float32)
+
+    # While loop: dynamic N read from device memory
+    block_idx = 0
+    while block_idx * BLOCK_N < N:
+        n_start = block_idx * BLOCK_N
+        n_offs = n_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offs < N
+
+        # ── MSE score ──
+        mse_scores = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for byte_idx in range(PACKED_D_MSE):
+            packed = tl.load(
+                MSE_ptr + pid_kv * stride_m_kv + n_offs * stride_m_n + byte_idx * stride_m_d,
+                mask=n_mask, other=0,
+            ).to(tl.int32)
+            for sub in range(VALS_PER_BYTE):
+                coord_idx = byte_idx * VALS_PER_BYTE + sub
+                if coord_idx < D:
+                    idx = (packed >> (sub * BITS)) & BIT_MASK
+                    centroid_val = tl.load(CENTROIDS_ptr + idx)
+                    mse_scores += q_rot[coord_idx] * centroid_val
+
+        key_norms = tl.load(
+            NORMS_ptr + pid_kv * stride_n_kv + n_offs * stride_n_n,
+            mask=n_mask, other=0.0,
+        ).to(tl.float32)
+        mse_scores = mse_scores * key_norms
+
+        # ── QJL score ──
+        qjl_dot = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for byte_idx in range(PACKED_D_SIGNS):
+            packed = tl.load(
+                SIGNS_ptr + pid_kv * stride_s_kv + n_offs * stride_s_n + byte_idx * stride_s_d,
+                mask=n_mask, other=0,
+            ).to(tl.int32)
+            for bit in range(8):
+                coord_idx = byte_idx * 8 + bit
+                if coord_idx < D:
+                    sign_bit = (packed >> bit) & 1
+                    sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
+                    qjl_dot += q_sketch[coord_idx] * sign_val
+
+        res_norms = tl.load(
+            RES_NORMS_ptr + pid_kv * stride_rn_kv + n_offs * stride_rn_n,
+            mask=n_mask, other=0.0,
+        ).to(tl.float32)
+        qjl_scores = qjl_dot * res_norms * QJL_SCALE
+
+        scores = (mse_scores + qjl_scores) * SM_SCALE
+        scores = tl.where(n_mask, scores, float("-inf"))
+
+        # ── Online softmax update ──
+        m_new = tl.maximum(m_i, tl.max(scores, 0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new)
+        l_i = l_i * alpha + tl.sum(p, 0)
+        acc = acc * alpha
+
+        # ── Value dequantize + accumulate ──
+        v_quant = tl.load(
+            V_DATA_ptr + pid_kv * stride_v_kv
+            + n_offs[:, None] * stride_v_n + d_offs[None, :] * stride_v_d,
+            mask=n_mask[:, None], other=0,
+        ).to(tl.float32)
+        g_offs = d_offs // GROUP_SIZE
+        v_scale = tl.load(
+            V_SCALES_ptr + pid_kv * stride_vs_kv
+            + n_offs[:, None] * stride_vs_n + g_offs[None, :] * stride_vs_g,
+            mask=n_mask[:, None], other=1.0,
+        ).to(tl.float32)
+        v_zero = tl.load(
+            V_ZEROS_ptr + pid_kv * stride_vz_kv
+            + n_offs[:, None] * stride_vz_n + g_offs[None, :] * stride_vz_g,
+            mask=n_mask[:, None], other=0.0,
+        ).to(tl.float32)
+        v_dequant = v_quant * v_scale + v_zero
+        acc += tl.sum(p[:, None] * v_dequant, 0)
+
+        m_i = m_new
+        block_idx += 1
+
+    tl.store(OUT_ptr + pid_q * stride_o_qh + d_offs * stride_o_d, acc)
+    tl.store(M_OUT_ptr + pid_q * stride_m_qh, m_i)
+    tl.store(L_OUT_ptr + pid_q * stride_l_qh, l_i)
+
+
+def turboquant_fused_decode_graph(
+    query: torch.Tensor,
+    quantized_key,
+    value_quantized,
+    Pi: torch.Tensor,
+    S: torch.Tensor,
+    centroids: torch.Tensor,
+    mse_bits: int,
+    qjl_scale: float,
+    sm_scale: float,
+    gqa_ratio: int,
+    group_size: int = 32,
+    # Pre-allocated output buffers (CUDA Graph compatible)
+    acc_buf: torch.Tensor = None,
+    m_buf: torch.Tensor = None,
+    l_buf: torch.Tensor = None,
+    # Device-side N counter
+    n_tensor: torch.Tensor = None,
+):
+    """CUDA-Graph-compatible fused decode with GQA.
+
+    Reads N from ``n_tensor`` device memory at runtime (while loop).
+    Writes into pre-allocated ``acc_buf``, ``m_buf``, ``l_buf``.
+    All tensor addresses remain stable across calls.
+
+    Returns (acc, m, l) — the SAME tensors passed in as acc_buf/m_buf/l_buf.
+    """
+    if query.dim() == 3:
+        query = query.squeeze(1)
+    QH, D = query.shape
+
+    q_rot = torch.matmul(query.float(), Pi.T)
+    q_sketch = torch.matmul(query.float(), S.T)
+
+    mse_packed = quantized_key.mse_indices
+    qjl_signs = quantized_key.qjl_signs
+    norms = quantized_key.norms
+    res_norms = quantized_key.residual_norms
+
+    if mse_packed.dim() > 3:
+        BH_actual = mse_packed.shape[0] * mse_packed.shape[1]
+        mse_packed = mse_packed.reshape(BH_actual, *mse_packed.shape[2:])
+        qjl_signs = qjl_signs.reshape(BH_actual, *qjl_signs.shape[2:])
+        norms = norms.reshape(BH_actual, -1)
+        res_norms = res_norms.reshape(BH_actual, -1)
+
+    packed_d_mse = mse_packed.shape[2]
+    packed_d_signs = qjl_signs.shape[2]
+
+    v_data = value_quantized.data
+    v_scales = value_quantized.scales
+    v_zeros = value_quantized.zeros
+    v_bits = value_quantized.bits if len(value_quantized) > 3 else 2
+    if v_bits == 2 and v_data.shape[-1] != D:
+        from turboquant.kv_cache import unpack_values
+        v_data = unpack_values(value_quantized)
+    elif v_bits == 4 and v_data.shape[-1] != D:
+        from turboquant.kv_cache import unpack_values
+        v_data = unpack_values(value_quantized)
+    if v_data.dim() > 3:
+        H_kv = mse_packed.shape[0]
+        v_data = v_data.reshape(H_kv, -1, D)
+        v_scales = v_scales.reshape(H_kv, -1, -1)
+        v_zeros = v_zeros.reshape(H_kv, -1, -1)
+
+    N_GROUPS = D // group_size
+    eff_bits, vals_per_byte = _get_packing_params(mse_bits)
+
+    if acc_buf is None:
+        acc_buf = torch.zeros(QH, D, device=query.device, dtype=torch.float32)
+    if m_buf is None:
+        m_buf = torch.zeros(QH, device=query.device, dtype=torch.float32)
+    if l_buf is None:
+        l_buf = torch.zeros(QH, device=query.device, dtype=torch.float32)
+    # Zero out output buffers
+    acc_buf.zero_()
+    m_buf.zero_()
+    l_buf.zero_()
+
+    BLOCK_N = 64  # fixed for CUDA Graph
+    grid = (QH,)
+
+    _turboquant_fused_decode_graph_kernel[grid](
+        q_rot, q_sketch,
+        mse_packed, qjl_signs, norms, res_norms, centroids,
+        v_data, v_scales, v_zeros,
+        acc_buf, m_buf, l_buf,
+        n_tensor,
+        q_rot.stride(0), q_rot.stride(1),
+        mse_packed.stride(0), mse_packed.stride(1), mse_packed.stride(2),
+        qjl_signs.stride(0), qjl_signs.stride(1), qjl_signs.stride(2),
+        norms.stride(0), norms.stride(1),
+        res_norms.stride(0), res_norms.stride(1),
+        v_data.stride(0), v_data.stride(1), v_data.stride(2),
+        v_scales.stride(0), v_scales.stride(1), v_scales.stride(2),
+        v_zeros.stride(0), v_zeros.stride(1), v_zeros.stride(2),
+        acc_buf.stride(0), acc_buf.stride(1),
+        m_buf.stride(0),
+        l_buf.stride(0),
+        D=D, PACKED_D_MSE=packed_d_mse, PACKED_D_SIGNS=packed_d_signs,
+        N_GROUPS=N_GROUPS, GROUP_SIZE=group_size,
+        BITS=eff_bits, VALS_PER_BYTE=vals_per_byte,
+        QJL_SCALE=qjl_scale, SM_SCALE=sm_scale,
+        GQA_RATIO=gqa_ratio,
+        BLOCK_N=BLOCK_N,
+        num_warps=4,
+    )
+
+    return acc_buf, m_buf, l_buf
