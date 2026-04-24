@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import logging
+import time
 import types
 from dataclasses import dataclass, field
 from typing import Optional
@@ -175,10 +176,14 @@ def _no_alloc_prefill_attention(
 def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                           capture_in_forward: bool = False):
     """Intercept forward to optionally use TQ decode.
-    
+
     If capture_in_forward=True, also capture K/V from forward args
     (needed when the backend has no separate do_kv_cache_update method).
     """
+
+    # Diagnostic: track decode step count per-layer, only log first N
+    _diag = {"step": 0}
+    _DIAG_MAX_STEPS = 5
 
     def _capture_kv(key, value, attn_metadata):
         """Capture K/V tensors into TQ store."""
@@ -201,18 +206,39 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         output_block_scale=None,
     ):
         mode = _GLOBAL_MODE
-        
+        is_decode = (attn_metadata is not None
+                     and getattr(attn_metadata, 'max_query_len', 0) <= 1)
+        should_log = is_decode and _diag["step"] < _DIAG_MAX_STEPS
+
+        if should_log:
+            torch.cuda.synchronize()
+            t_total_0 = time.perf_counter()
 
         # Capture K/V when no separate kv_update hook exists
         if capture_in_forward and mode not in (MODE_OFF,) and attn_metadata is not None:
             _capture_kv(key, value, attn_metadata)
 
+        if should_log:
+            torch.cuda.synchronize()
+            t_after_capture = time.perf_counter()
+
         # Off or capture-only: always use flash
         if mode in (MODE_OFF, MODE_CAPTURE_ONLY):
-            return orig_fn(
+            ret = orig_fn(
                 self_impl, layer, query, key, value, kv_cache,
                 attn_metadata, output, output_scale, output_block_scale,
             )
+            if should_log:
+                torch.cuda.synchronize()
+                _diag["step"] += 1
+                print(
+                    f"[TQ-FWD] layer={state.config.layer_idx} "
+                    f"path=orig_fn(mode={mode}) "
+                    f"capture={(t_after_capture-t_total_0)*1000:.2f}ms "
+                    f"total={(time.perf_counter()-t_total_0)*1000:.2f}ms",
+                    flush=True,
+                )
+            return ret
 
         # Profiling pass or prefill: use flash
         if attn_metadata is None:
@@ -248,7 +274,16 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # --- Hybrid decode ---
         if mode == MODE_HYBRID and state.supports_hybrid:
+            if should_log:
+                torch.cuda.synchronize()
+                t_hybrid_start = time.perf_counter()
+
             flat = state.store.get_flat_cache()
+
+            if should_log:
+                torch.cuda.synchronize()
+                t_after_flat = time.perf_counter()
+
             if flat is not None and flat.num_tokens >= 16:
                 num_actual = attn_metadata.num_actual_tokens
                 q = query[:num_actual]
@@ -259,6 +294,10 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 recent_k = recent[0] if recent else None
                 recent_v = recent[1] if recent else None
 
+                if should_log:
+                    torch.cuda.synchronize()
+                    t_after_prepare = time.perf_counter()
+
                 result = compute_hybrid_attention(
                     query=q,
                     store=state.store,
@@ -267,6 +306,10 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                     num_query_heads=state.config.num_query_heads,
                     scale=getattr(self_impl, "scale", None),
                 )
+
+                if should_log:
+                    torch.cuda.synchronize()
+                    t_after_compute = time.perf_counter()
 
                 result_flat = result.reshape(
                     num_actual, state.config.num_query_heads * state.config.head_dim
@@ -278,6 +321,21 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                         out_slice.copy_(result.to(out_slice.dtype))
                     else:
                         out_slice.copy_(result_flat.to(out_slice.dtype))
+                    if should_log:
+                        torch.cuda.synchronize()
+                        _diag["step"] += 1
+                        n_hist = flat.num_tokens
+                        n_recent = recent_k.shape[0] if recent_k is not None else 0
+                        print(
+                            f"[TQ-FWD] layer={state.config.layer_idx} "
+                            f"path=hybrid hist={n_hist} recent={n_recent} "
+                            f"capture={(t_after_capture-t_total_0)*1000:.2f}ms "
+                            f"get_flat={(t_after_flat-t_hybrid_start)*1000:.2f}ms "
+                            f"prepare={(t_after_prepare-t_after_flat)*1000:.2f}ms "
+                            f"compute={(t_after_compute-t_after_prepare)*1000:.2f}ms "
+                            f"total={(time.perf_counter()-t_total_0)*1000:.2f}ms",
+                            flush=True,
+                        )
                     return output
                 if query.dim() == 3:
                     return result.to(query.dtype)
@@ -320,12 +378,31 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                         out_slice.copy_(result.to(out_slice.dtype))
                     else:
                         out_slice.copy_(result_flat.to(out_slice.dtype))
+                    if should_log:
+                        torch.cuda.synchronize()
+                        _diag["step"] += 1
+                        n_hist = flat.num_tokens if flat else 0
+                        n_recent = recent_k.shape[0] if recent_k is not None else 0
+                        print(
+                            f"[TQ-FWD] layer={state.config.layer_idx} "
+                            f"path=no_alloc_fallback hist={n_hist} recent={n_recent} "
+                            f"total={(time.perf_counter()-t_total_0)*1000:.2f}ms",
+                            flush=True,
+                        )
                     return output
                 if query.dim() == 3:
                     return result.to(query.dtype)
                 return result_flat
 
             # No KV data at all (very first decode before ring is populated)
+            if should_log:
+                _diag["step"] += 1
+                print(
+                    f"[TQ-FWD] layer={state.config.layer_idx} "
+                    f"path=zeros(no_data) "
+                    f"total={(time.perf_counter()-t_total_0)*1000:.2f}ms",
+                    flush=True,
+                )
             num_actual = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
             if query.dim() == 3:
                 return torch.zeros_like(query[:num_actual])
@@ -334,6 +411,16 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 state.config.num_query_heads * state.config.head_dim,
                 dtype=query.dtype,
                 device=query.device,
+            )
+
+        if should_log:
+            torch.cuda.synchronize()
+            _diag["step"] += 1
+            print(
+                f"[TQ-FWD] layer={state.config.layer_idx} "
+                f"path=orig_fn(fallback) "
+                f"total={(time.perf_counter()-t_total_0)*1000:.2f}ms",
+                flush=True,
             )
         return orig_fn(
             self_impl, layer, query, key, value, kv_cache,
@@ -480,6 +567,25 @@ def install_hooks(
         f"[TurboQuant] Hooks on {len(layer_states)} layers "
         f"(mode={mode}, no_alloc={no_alloc})"
     )
+
+    # Diagnostic init log
+    n_flash = sum(1 for s in layer_states.values() if s.config.backend_kind == "flash")
+    n_mla = len(layer_states) - n_flash
+    print(
+        f"[TQ-INIT] layers={len(layer_states)} flash={n_flash} mla={n_mla} "
+        f"mode={mode} no_alloc={no_alloc} "
+        f"capture_in_forward=True compute_path=score.py_pytorch",
+        flush=True,
+    )
+    for name, s in layer_states.items():
+        print(
+            f"[TQ-INIT]   {name}: backend={s.config.backend_kind} "
+            f"kv_heads={s.config.num_kv_heads} q_heads={s.config.num_query_heads} "
+            f"head_dim={s.config.head_dim} key_bits={s.config.key_bits} "
+            f"value_bits={s.config.value_bits}",
+            flush=True,
+        )
+
     return layer_states
 
 

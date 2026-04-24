@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import math
 import logging
+import time
 import torch
 import torch.nn.functional as F
 
@@ -24,6 +25,10 @@ from turboquant.quantizer import TurboQuantProd
 logger = logging.getLogger("turboquant.score")
 
 MIN_HISTORY_FOR_TQ = 16
+
+# ---- Diagnostic timing: only log first N calls per process ----
+_DIAG_MAX_LOG = 10
+_diag_log_count = 0
 
 
 def compute_hybrid_attention(
@@ -90,10 +95,40 @@ def _attend_compressed_only(
     scale: float,
 ) -> torch.Tensor:
     """Attention over compressed history only (PyTorch path)."""
+    global _diag_log_count
+    should_log = _diag_log_count < _DIAG_MAX_LOG
+    if should_log:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
     k_dequant = quantizer.dequantize(flat.prod_q)  # (H_kv, N, D)
+
+    if should_log:
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
     v_dequant = dequantize_values(flat.value_q, 32)
 
-    return _matmul_attend(query, k_dequant, v_dequant, gqa_ratio, num_kv_heads, scale)
+    if should_log:
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+
+    result = _matmul_attend(query, k_dequant, v_dequant, gqa_ratio, num_kv_heads, scale)
+
+    if should_log:
+        torch.cuda.synchronize()
+        t3 = time.perf_counter()
+        _diag_log_count += 1
+        print(
+            f"[TQ-SCORE] compressed_only layer=N/A "
+            f"dequant_k={(t1-t0)*1000:.2f}ms "
+            f"dequant_v={(t2-t1)*1000:.2f}ms "
+            f"attend={(t3-t2)*1000:.2f}ms "
+            f"N_hist={flat.num_tokens}",
+            flush=True,
+        )
+
+    return result
 
 
 def _attend_exact_only(
@@ -123,8 +158,23 @@ def _attend_hybrid(
     scale: float,
 ) -> torch.Tensor:
     """Merge compressed history + exact recent via concatenated attention."""
+    global _diag_log_count
+    should_log = _diag_log_count < _DIAG_MAX_LOG
+    if should_log:
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
     k_hist = quantizer.dequantize(flat.prod_q)  # (H_kv, N_hist, D)
+
+    if should_log:
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+
     v_hist = dequantize_values(flat.value_q, 32)
+
+    if should_log:
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
 
     k_recent = recent_k.transpose(0, 1)   # (H_kv, N_recent, D)
     v_recent = recent_v.transpose(0, 1)
@@ -132,7 +182,27 @@ def _attend_hybrid(
     k_all = torch.cat([k_hist.float(), k_recent.float()], dim=1)
     v_all = torch.cat([v_hist.float(), v_recent.float()], dim=1)
 
-    return _matmul_attend(query, k_all, v_all, gqa_ratio, num_kv_heads, scale)
+    if should_log:
+        torch.cuda.synchronize()
+        t3 = time.perf_counter()
+
+    result = _matmul_attend(query, k_all, v_all, gqa_ratio, num_kv_heads, scale)
+
+    if should_log:
+        torch.cuda.synchronize()
+        t4 = time.perf_counter()
+        _diag_log_count += 1
+        print(
+            f"[TQ-SCORE] hybrid "
+            f"dequant_k={(t1-t0)*1000:.2f}ms "
+            f"dequant_v={(t2-t1)*1000:.2f}ms "
+            f"concat={(t3-t2)*1000:.2f}ms "
+            f"attend={(t4-t3)*1000:.2f}ms "
+            f"N_hist={flat.num_tokens} N_recent={recent_k.shape[0]}",
+            flush=True,
+        )
+
+    return result
 
 
 def _matmul_attend(
