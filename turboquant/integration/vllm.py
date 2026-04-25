@@ -242,8 +242,15 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
             else:
                 state.engine.prepare_for_decode()
 
-        # Capture K/V when no separate kv_update hook exists
-        if capture_in_forward and mode not in (MODE_OFF,) and attn_metadata is not None:
+        # Capture K/V when no separate kv_update hook exists.
+        # Skip during CUDA Graph stream capture: quantization creates new
+        # tensors (torch.tensor, torch.cat) which is forbidden inside capture.
+        # At runtime the graph replays without Python involvement so this code
+        # is never reached; only warmup/profiling triggers the guard.
+        if (capture_in_forward
+                and mode not in (MODE_OFF,)
+                and attn_metadata is not None
+                and not torch.cuda.is_current_stream_capturing()):
             _capture_kv(key, value, attn_metadata)
 
         if should_log:
