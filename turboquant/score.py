@@ -145,10 +145,10 @@ def compute_hybrid_attention(
     has_recent = recent_k is not None and recent_k.shape[0] > 0
 
     if not has_history and not has_recent:
-        return torch.zeros(
-            query.shape[0], num_query_heads, head_dim,
-            device=query.device, dtype=query.dtype,
-        )
+        # During CUDA Graph capture, torch.zeros() allocates (graph-unsafe).
+        # Use multiplication by 0 on the query to get a zero tensor with
+        # the right shape/dtype/device without new allocation (graph-safe).
+        return query * 0.0
 
     gqa_ratio = num_query_heads // num_kv_heads
 

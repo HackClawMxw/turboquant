@@ -171,7 +171,7 @@ class RingBuffer:
             [self.capacity], device=self.device, dtype=torch.int64,
         )
         self._arange_buf = torch.arange(
-            self.capacity, device=self.device, dtype=torch.int32,
+            self.capacity, device=self.device, dtype=torch.int64,
         )
         self._graph_mode = True
 
@@ -212,9 +212,9 @@ class RingBuffer:
             (ring_k, ring_v, count_tensor, arange_buf, capacity_tensor)
             - ring_k: (capacity, H, D) — full buffer
             - ring_v: (capacity, H, D) — full buffer
-            - count_tensor: (1,) int32 — number of valid entries
-            - arange_buf: (capacity,) int32 — for masking
-            - capacity_tensor: (1,) int32 — ring buffer capacity
+            - count_tensor: (1,) int64 — number of valid entries
+            - arange_buf: (capacity,) int64 — for masking
+            - capacity_tensor: (1,) int64 — ring buffer capacity
         """
         return self._k, self._v, self._count_tensor, self._arange_buf, self._capacity_tensor
 

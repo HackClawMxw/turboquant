@@ -246,14 +246,15 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         # - Decode (T=1): ring buffer write_graph is graph-safe and must be
         #   captured INTO the CUDA graph for replay.  Always proceed.
         # - Prefill (T>1): quantization creates new tensors which is forbidden
-        #   during stream capture.  Skip during capture; warmup/profiling only.
+        #   during CUDA Graph capture.  Use _graph_intended (more reliable than
+        #   is_current_stream_capturing which fails on non-default streams).
         if (capture_in_forward
                 and mode not in (MODE_OFF,)
                 and attn_metadata is not None):
             num_tok = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
             if num_tok <= 1:
                 _capture_kv(key, value, attn_metadata)
-            elif not torch.cuda.is_current_stream_capturing():
+            elif not _graph_intended:
                 _capture_kv(key, value, attn_metadata)
 
         if should_log:
@@ -326,16 +327,15 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
             # safe because this only happens during memory profiling — actual
             # inference uses the T = 1 captured graph.
             if q.shape[0] > 1 and _graph_intended:
+                # output is always provided by vLLM during graph capture.
+                # Zero it out in-place (graph-safe).  Fall through to orig_fn
+                # if somehow output is None (non-graph path won't hit this).
                 if output is not None:
                     output[:num_actual].zero_()
                     return output
-                if query.dim() == 3:
-                    return torch.zeros_like(query[:num_actual])
-                return torch.zeros(
-                    num_actual,
-                    state.config.num_query_heads * state.config.head_dim,
-                    dtype=query.dtype,
-                    device=query.device,
+                return orig_fn(
+                    self_impl, layer, query, key, value, kv_cache,
+                    attn_metadata, output, output_scale, output_block_scale,
                 )
 
             flat = state.store.get_flat_cache()
@@ -423,13 +423,9 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 if output is not None:
                     output[:num_actual].zero_()
                     return output
-                if query.dim() == 3:
-                    return torch.zeros_like(query[:num_actual])
-                return torch.zeros(
-                    num_actual,
-                    state.config.num_query_heads * state.config.head_dim,
-                    dtype=query.dtype,
-                    device=query.device,
+                return orig_fn(
+                    self_impl, layer, query, key, value, kv_cache,
+                    attn_metadata, output, output_scale, output_block_scale,
                 )
 
             flat = state.store.get_flat_cache()
@@ -483,7 +479,8 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                     return result.to(query.dtype)
                 return result_flat
 
-            # No KV data at all (very first decode before ring is populated)
+            # No KV data at all (very first decode before ring is populated).
+            # During graph capture, must not allocate new tensors.
             if should_log:
                 _diag["step"] += 1
                 print(
@@ -493,13 +490,13 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                     flush=True,
                 )
             num_actual = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
-            if query.dim() == 3:
-                return torch.zeros_like(query[:num_actual])
-            return torch.zeros(
-                num_actual,
-                state.config.num_query_heads * state.config.head_dim,
-                dtype=query.dtype,
-                device=query.device,
+            if output is not None:
+                output[:num_actual].zero_()
+                return output
+            # Fallback: use orig_fn (never reached during graph capture)
+            return orig_fn(
+                self_impl, layer, query, key, value, kv_cache,
+                attn_metadata, output, output_scale, output_block_scale,
             )
 
         if should_log:
