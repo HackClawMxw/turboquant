@@ -281,7 +281,7 @@ def _compressed_graph(query, flat, store, gqa_ratio, scale, layer_state):
         Pi=quantizer.mse_quantizer.Pi,
         S=quantizer.S,
         centroids=quantizer.mse_quantizer.centroids,
-        mse_bits=quantizer.mse_bits,
+        mse_bits=store.mse_bits,
         qjl_scale=quantizer.qjl_scale,
         sm_scale=scale,
         gqa_ratio=gqa_ratio,
@@ -317,7 +317,7 @@ def _hybrid_graph(query, flat, store, recent_k, recent_v,
         Pi=quantizer.mse_quantizer.Pi,
         S=quantizer.S,
         centroids=quantizer.mse_quantizer.centroids,
-        mse_bits=quantizer.mse_bits,
+        mse_bits=store.mse_bits,
         qjl_scale=quantizer.qjl_scale,
         sm_scale=scale,
         gqa_ratio=gqa_ratio,
@@ -381,7 +381,7 @@ def _compressed_fused(query, flat, store, gqa_ratio, scale):
         query=q, quantized_key=flat.prod_q, value_quantized=flat.value_q,
         Pi=store.quantizer.mse_quantizer.Pi, S=store.quantizer.S,
         centroids=store.quantizer.mse_quantizer.centroids,
-        mse_bits=store.quantizer.mse_bits, qjl_scale=store.quantizer.qjl_scale,
+        mse_bits=store.mse_bits, qjl_scale=store.quantizer.qjl_scale,
         sm_scale=scale, gqa_ratio=gqa_ratio,
     )
     return (acc / l.unsqueeze(-1)).unsqueeze(0).to(query.dtype)
@@ -397,7 +397,7 @@ def _hybrid_fused(query, flat, store, recent_k, recent_v, gqa_ratio, num_kv_head
         query=q, quantized_key=flat.prod_q, value_quantized=flat.value_q,
         Pi=store.quantizer.mse_quantizer.Pi, S=store.quantizer.S,
         centroids=store.quantizer.mse_quantizer.centroids,
-        mse_bits=store.quantizer.mse_bits, qjl_scale=store.quantizer.qjl_scale,
+        mse_bits=store.mse_bits, qjl_scale=store.quantizer.qjl_scale,
         sm_scale=scale, gqa_ratio=gqa_ratio,
     )
 
@@ -431,7 +431,7 @@ def _compressed_score_triton(query, flat, store, gqa_ratio, num_kv_heads, scale)
         res_norms=flat.prod_q.residual_norms,
         centroids=store.quantizer.mse_quantizer.centroids,
         Pi=store.quantizer.mse_quantizer.Pi, S=store.quantizer.S,
-        mse_bits=store.quantizer.mse_bits, qjl_scale=store.quantizer.qjl_scale,
+        mse_bits=store.mse_bits, qjl_scale=store.quantizer.qjl_scale,
         gqa_ratio=gqa_ratio,
     ).unsqueeze(0) * scale
     weights = F.softmax(scores.float(), dim=-1)
@@ -451,7 +451,7 @@ def _hybrid_score_triton(query, flat, store, recent_k, recent_v, gqa_ratio, num_
         res_norms=flat.prod_q.residual_norms,
         centroids=store.quantizer.mse_quantizer.centroids,
         Pi=store.quantizer.mse_quantizer.Pi, S=store.quantizer.S,
-        mse_bits=store.quantizer.mse_bits, qjl_scale=store.quantizer.qjl_scale,
+        mse_bits=store.mse_bits, qjl_scale=store.quantizer.qjl_scale,
         gqa_ratio=gqa_ratio,
     ).unsqueeze(0)
 
