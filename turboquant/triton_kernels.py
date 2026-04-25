@@ -1153,10 +1153,12 @@ def _turboquant_fused_decode_graph_kernel(
     # Read N dynamically from device memory
     N = tl.load(N_PTR).to(tl.int32)
 
-    # Load query vectors once into registers
-    d_offs = tl.arange(0, D)
-    q_rot = tl.load(Q_ROT_ptr + pid_q * stride_q_qh + d_offs * stride_q_d).to(tl.float32)
-    q_sketch = tl.load(Q_SKETCH_ptr + pid_q * stride_q_qh + d_offs * stride_q_d).to(tl.float32)
+    # Load query vectors: store base pointers for element-wise access
+    # (indexing a loaded tensor with a Python int inside nested loops
+    #  triggers a Triton 3.x compilation bug, so we load per-element)
+    q_rot_base = Q_ROT_ptr + pid_q * stride_q_qh
+    q_sketch_base = Q_SKETCH_ptr + pid_q * stride_q_qh
+    d_offs = tl.arange(0, D)  # needed for value dequant and output store
 
     m_i = tl.zeros([1], dtype=tl.float32) - float("inf")
     l_i = tl.zeros([1], dtype=tl.float32)
@@ -1181,7 +1183,8 @@ def _turboquant_fused_decode_graph_kernel(
                 if coord_idx < D:
                     idx = (packed >> (sub * BITS)) & BIT_MASK
                     centroid_val = tl.load(CENTROIDS_ptr + idx)
-                    mse_scores += q_rot[coord_idx] * centroid_val
+                    q_val = tl.load(q_rot_base + coord_idx * stride_q_d).to(tl.float32)
+                    mse_scores += q_val * centroid_val
 
         key_norms = tl.load(
             NORMS_ptr + pid_kv * stride_n_kv + n_offs * stride_n_n,
@@ -1201,7 +1204,8 @@ def _turboquant_fused_decode_graph_kernel(
                 if coord_idx < D:
                     sign_bit = (packed >> bit) & 1
                     sign_val = tl.where(sign_bit == 1, 1.0, -1.0)
-                    qjl_dot += q_sketch[coord_idx] * sign_val
+                    s_val = tl.load(q_sketch_base + coord_idx * stride_q_d).to(tl.float32)
+                    qjl_dot += s_val * sign_val
 
         res_norms = tl.load(
             RES_NORMS_ptr + pid_kv * stride_rn_kv + n_offs * stride_rn_n,
