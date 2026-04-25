@@ -306,6 +306,28 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 torch.cuda.synchronize()
                 t_hybrid_start = time.perf_counter()
 
+            num_actual = attn_metadata.num_actual_tokens
+            q = query[:num_actual]
+            if q.dim() == 2:
+                q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
+
+            # Multi-token decode (T > 1) during CUDA Graph warmup: the graph-
+            # compatible Triton kernel only supports T = 1.  Returning zeros is
+            # safe because this only happens during memory profiling — actual
+            # inference uses the T = 1 captured graph.
+            if q.shape[0] > 1 and _graph_intended:
+                result_flat = torch.zeros(
+                    num_actual,
+                    state.config.num_query_heads * state.config.head_dim,
+                    dtype=query.dtype,
+                    device=query.device,
+                )
+                if output is not None:
+                    out_slice = output[:num_actual]
+                    out_slice.copy_(result_flat)
+                    return output
+                return result_flat
+
             flat = state.store.get_flat_cache()
 
             if should_log:
@@ -313,10 +335,6 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 t_after_flat = time.perf_counter()
 
             if flat is not None and flat.num_tokens >= 16:
-                num_actual = attn_metadata.num_actual_tokens
-                q = query[:num_actual]
-                if q.dim() == 2:
-                    q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
 
                 # In CUDA-Graph mode, use full ring buffer (masking handled
                 # in score.py's _hybrid_graph via device count tensor).
@@ -381,6 +399,29 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         if no_alloc:
             # no_alloc mode: paged cache is not populated, so flash attention
             # would read garbage. Use TQ attention (compressed + exact recent).
+            num_actual = getattr(attn_metadata, "num_actual_tokens", query.shape[0])
+            q_fb = query[:num_actual]
+            if q_fb.dim() == 2:
+                q_fb = q_fb.view(
+                    num_actual,
+                    state.config.num_query_heads,
+                    state.config.head_dim,
+                )
+
+            # Same T > 1 shortcut as above (CUDA Graph warmup profiling).
+            if q_fb.shape[0] > 1 and _graph_intended:
+                result_flat = torch.zeros(
+                    num_actual,
+                    state.config.num_query_heads * state.config.head_dim,
+                    dtype=query.dtype,
+                    device=query.device,
+                )
+                if output is not None:
+                    out_slice = output[:num_actual]
+                    out_slice.copy_(result_flat)
+                    return output
+                return result_flat
+
             flat = state.store.get_flat_cache()
             has_history = flat is not None and flat.num_tokens >= MIN_HISTORY_FOR_TQ
 
@@ -396,13 +437,8 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 recent_v = recent[1] if recent else None
 
             if has_history or has_recent:
-                num_actual = attn_metadata.num_actual_tokens
-                q = query[:num_actual]
-                if q.dim() == 2:
-                    q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
-
                 result = compute_hybrid_attention(
-                    query=q,
+                    query=q_fb,
                     store=state.store,
                     recent_k=recent_k,
                     recent_v=recent_v,
