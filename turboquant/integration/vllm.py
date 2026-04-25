@@ -208,7 +208,8 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         mode = _GLOBAL_MODE
         is_decode = (attn_metadata is not None
                      and getattr(attn_metadata, 'max_query_len', 0) <= 1)
-        should_log = is_decode and _diag["step"] < _DIAG_MAX_STEPS
+        _capturing = torch.cuda.is_current_stream_capturing()
+        should_log = is_decode and _diag["step"] < _DIAG_MAX_STEPS and not _capturing
 
         if should_log:
             torch.cuda.synchronize()
@@ -216,8 +217,14 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # Prefill-to-decode transition: compress prefill ring buffer
         # into the store and reset device tensors for graph mode.
+        # During CUDA Graph capture, only reset device tensors (skip heavy ops).
         if is_decode and not state.engine._was_decoding:
-            state.engine.prepare_for_decode()
+            if _capturing:
+                # Graph capture: just reset device tensors, skip drain/compress
+                if state.engine.ring._graph_mode:
+                    state.engine.ring.reset_for_graph()
+            else:
+                state.engine.prepare_for_decode()
 
         # Capture K/V when no separate kv_update hook exists
         if capture_in_forward and mode not in (MODE_OFF,) and attn_metadata is not None:
