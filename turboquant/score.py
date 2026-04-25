@@ -38,18 +38,25 @@ try:
     from turboquant.triton_kernels import turboquant_fused_decode_gqa
     _FUSED_AVAILABLE = True
     _SCORE_AVAILABLE = True
-except (ImportError, Exception):
-    pass
+except (ImportError, Exception) as _e:
+    import sys
+    print(f"[TQ-TRITON] turboquant_fused_decode_gqa import failed: "
+          f"{type(_e).__name__}: {_e}", file=sys.stderr, flush=True)
 try:
     from turboquant.triton_kernels import turboquant_scores_gqa
     _SCORE_AVAILABLE = True
-except (ImportError, Exception):
-    pass
+except (ImportError, Exception) as _e:
+    import sys
+    print(f"[TQ-TRITON] turboquant_scores_gqa import failed: "
+          f"{type(_e).__name__}: {_e}", file=sys.stderr, flush=True)
 try:
     from turboquant.triton_kernels import turboquant_fused_decode_graph
     _GRAPH_AVAILABLE = True
-except (ImportError, Exception):
+except (ImportError, Exception) as _e:
     _GRAPH_AVAILABLE = False
+    import sys
+    print(f"[TQ-TRITON] turboquant_fused_decode_graph import failed: "
+          f"{type(_e).__name__}: {_e}", file=sys.stderr, flush=True)
 
 if _GRAPH_AVAILABLE:
     _triton_path = "graph"
