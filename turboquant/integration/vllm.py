@@ -74,10 +74,21 @@ class LayerState:
     store: CompressedKVStore
     engine: KVCaptureEngine
     _log_count: int = 0
+    _no_alloc: bool = False
 
     @property
     def supports_hybrid(self) -> bool:
         return self.config.backend_kind == "flash"
+
+    @property
+    def graph_intended(self) -> bool:
+        """True if CUDA Graph capture is expected (preallocated or no_alloc mode).
+
+        When True, all torch.cuda.synchronize() and other graph-unsafe ops
+        must be skipped.  Covers the case where preallocation failed but
+        we're still in no_alloc mode (where vLLM will attempt graph capture).
+        """
+        return self.store.is_preallocated or self._no_alloc
 
     def reset(self):
         self.engine.reset()
@@ -208,11 +219,12 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         mode = _GLOBAL_MODE
         is_decode = (attn_metadata is not None
                      and getattr(attn_metadata, 'max_query_len', 0) <= 1)
-        # When store is pre-allocated, CUDA Graph may be active at any time.
-        # Disable all diagnostic timing (torch.cuda.synchronize is forbidden
-        # during graph capture, and is_current_stream_capturing() is unreliable
-        # when vLLM uses non-default capture streams).
-        _graph_intended = state.store.is_preallocated
+        # When store is pre-allocated or no_alloc mode is active, CUDA Graph
+        # may be capturing at any time.  Disable all diagnostic timing
+        # (torch.cuda.synchronize is forbidden during graph capture, and
+        # is_current_stream_capturing() is unreliable when vLLM uses
+        # non-default capture streams).
+        _graph_intended = state.graph_intended
         should_log = is_decode and _diag["step"] < _DIAG_MAX_STEPS and not _graph_intended
 
         if should_log:
@@ -550,6 +562,7 @@ def install_hooks(
         )
 
         state = _create_layer_state(cfg)
+        state._no_alloc = no_alloc
         layer_states[layer_name] = state
 
         if backend_kind == "flash":
@@ -613,6 +626,21 @@ def install_hooks(
     except Exception:
         pass
 
+    # Fallback: try model_config if scheduler_config didn't work
+    if max_tokens <= 0:
+        try:
+            model_config = getattr(model_runner, 'model_config', None)
+            if model_config is not None:
+                max_tokens = getattr(model_config, 'max_model_len', 0)
+        except Exception:
+            pass
+
+    print(
+        f"[TQ-PREALLOC] max_tokens={max_tokens} no_alloc={no_alloc} "
+        f"n_hybrid={sum(1 for s in layer_states.values() if s.supports_hybrid)}",
+        flush=True,
+    )
+
     if max_tokens > 0:
         for name, state in layer_states.items():
             if state.supports_hybrid:
@@ -622,6 +650,29 @@ def install_hooks(
                     logger.warning(
                         "[TurboQuant] Pre-allocation failed for %s: %s", name, e
                     )
+    else:
+        if no_alloc:
+            logger.error(
+                "[TurboQuant] CRITICAL: no_alloc=True but max_tokens=%d — "
+                "preallocation skipped! CUDA Graph capture WILL fail. "
+                "Check scheduler_config availability.",
+                max_tokens,
+            )
+
+    # Log preallocation results
+    n_prealloc = sum(
+        1 for s in layer_states.values()
+        if s.supports_hybrid and s.store.is_preallocated
+    )
+    n_graph_ready = sum(
+        1 for s in layer_states.values()
+        if s.supports_hybrid and s.engine.ring._graph_mode
+    )
+    print(
+        f"[TQ-PREALLOC] result: stores_ready={n_prealloc} "
+        f"ring_ready={n_graph_ready} graph_intended={no_alloc}",
+        flush=True,
+    )
 
     # Patch model runner to detect ring buffer overflow and compress
     # between CUDA Graph replays.  This Python hook runs after every
@@ -661,7 +712,8 @@ def install_hooks(
             f"[TQ-INIT]   {name}: backend={s.config.backend_kind} "
             f"kv_heads={s.config.num_kv_heads} q_heads={s.config.num_query_heads} "
             f"head_dim={s.config.head_dim} key_bits={s.config.key_bits} "
-            f"value_bits={s.config.value_bits}",
+            f"value_bits={s.config.value_bits} "
+            f"prealloc={s.store.is_preallocated} graph={s.graph_intended}",
             flush=True,
         )
 
