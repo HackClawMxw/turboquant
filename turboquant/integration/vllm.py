@@ -344,7 +344,7 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 torch.cuda.synchronize()
                 t_after_flat = time.perf_counter()
 
-            if flat is not None and flat.num_tokens >= 16:
+            if flat is not None and (state.store.is_preallocated or flat.num_tokens >= 16):
 
                 # In CUDA-Graph mode, use full ring buffer (masking handled
                 # in score.py's _hybrid_graph via device count tensor).
@@ -429,7 +429,9 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 )
 
             flat = state.store.get_flat_cache()
-            has_history = flat is not None and flat.num_tokens >= MIN_HISTORY_FOR_TQ
+            has_history = flat is not None and (
+                state.store.is_preallocated or flat.num_tokens >= MIN_HISTORY_FOR_TQ
+            )
 
             # In graph mode, ring buffer is always non-empty after write_graph
             if state.engine.ring.graph_ready:

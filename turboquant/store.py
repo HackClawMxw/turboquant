@@ -244,13 +244,17 @@ class CompressedKVStore:
     def get_flat_cache(self) -> Optional[FlatCache]:
         """Return flat cache view.
 
-        For pre-allocated stores: returns the full fixed-address tensors.
-        The actual valid count is in ``self.n_tensor`` (device int32).
+        For pre-allocated stores: always returns the full fixed-address tensors,
+        even when empty.  This is critical for CUDA Graph capture: the graph
+        must record the hybrid attention path during capture (when the store is
+        empty) so that replay (when the store has prefill data) follows the
+        same code path.  The actual valid token count is tracked by the
+        device-side ``self._n_tensor``.
         For legacy stores: concatenates chunks.
         """
         if self.is_preallocated:
-            if self._write_pos == 0:
-                return None
+            # ALWAYS return the cache for preallocated stores, even when empty.
+            # The Triton kernels read the actual count from _n_tensor (device).
             return FlatCache(
                 prod_q=ProdQuantized(
                     mse_indices=self._flat_mse,
