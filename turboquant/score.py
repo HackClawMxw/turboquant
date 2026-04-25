@@ -164,8 +164,8 @@ def compute_hybrid_attention(
 
 def _attend_compressed_only(query, flat, store, gqa_ratio, num_kv_heads, scale, layer_state):
     global _diag_log_count
-    _capturing = torch.cuda.is_current_stream_capturing()
-    should_log = _diag_log_count < _DIAG_MAX_LOG and not _capturing
+    _graph_intended = store.is_preallocated
+    should_log = _diag_log_count < _DIAG_MAX_LOG and not _graph_intended
     if should_log:
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -202,8 +202,8 @@ def _attend_compressed_only(query, flat, store, gqa_ratio, num_kv_heads, scale, 
 def _attend_hybrid(query, flat, store, recent_k, recent_v,
                    gqa_ratio, num_kv_heads, head_dim, scale, layer_state):
     global _diag_log_count
-    _capturing = torch.cuda.is_current_stream_capturing()
-    should_log = _diag_log_count < _DIAG_MAX_LOG and not _capturing
+    _graph_intended = store.is_preallocated
+    should_log = _diag_log_count < _DIAG_MAX_LOG and not _graph_intended
     if should_log:
         torch.cuda.synchronize()
         t0 = time.perf_counter()

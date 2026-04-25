@@ -208,8 +208,12 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         mode = _GLOBAL_MODE
         is_decode = (attn_metadata is not None
                      and getattr(attn_metadata, 'max_query_len', 0) <= 1)
-        _capturing = torch.cuda.is_current_stream_capturing()
-        should_log = is_decode and _diag["step"] < _DIAG_MAX_STEPS and not _capturing
+        # When store is pre-allocated, CUDA Graph may be active at any time.
+        # Disable all diagnostic timing (torch.cuda.synchronize is forbidden
+        # during graph capture, and is_current_stream_capturing() is unreliable
+        # when vLLM uses non-default capture streams).
+        _graph_intended = state.store.is_preallocated
+        should_log = is_decode and _diag["step"] < _DIAG_MAX_STEPS and not _graph_intended
 
         if should_log:
             torch.cuda.synchronize()
@@ -217,10 +221,10 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # Prefill-to-decode transition: compress prefill ring buffer
         # into the store and reset device tensors for graph mode.
-        # During CUDA Graph capture, only reset device tensors (skip heavy ops).
+        # When graph is intended, only reset device tensors (skip heavy ops
+        # like drain/quantize that are incompatible with CUDA Graph capture).
         if is_decode and not state.engine._was_decoding:
-            if _capturing:
-                # Graph capture: just reset device tensors, skip drain/compress
+            if _graph_intended:
                 if state.engine.ring._graph_mode:
                     state.engine.ring.reset_for_graph()
             else:
