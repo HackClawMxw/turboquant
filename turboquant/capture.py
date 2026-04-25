@@ -165,10 +165,10 @@ class RingBuffer:
 
         Call once during model initialisation, before any CUDA Graph capture.
         """
-        self._pos_tensor = torch.zeros(1, device=self.device, dtype=torch.int32)
-        self._count_tensor = torch.zeros(1, device=self.device, dtype=torch.int32)
+        self._pos_tensor = torch.zeros(1, device=self.device, dtype=torch.int64)
+        self._count_tensor = torch.zeros(1, device=self.device, dtype=torch.int64)
         self._capacity_tensor = torch.tensor(
-            [self.capacity], device=self.device, dtype=torch.int32,
+            [self.capacity], device=self.device, dtype=torch.int64,
         )
         self._arange_buf = torch.arange(
             self.capacity, device=self.device, dtype=torch.int32,
