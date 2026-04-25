@@ -193,9 +193,9 @@ class RingBuffer:
             key = key.unsqueeze(0)
             value = value.unsqueeze(0)
 
-        # Write K/V at current position
-        self._k.index_copy_(0, self._pos_tensor, key)
-        self._v.index_copy_(0, self._pos_tensor, value)
+        # Write K/V at current position (cast to buffer dtype if needed)
+        self._k.index_copy_(0, self._pos_tensor, key.to(self._k.dtype))
+        self._v.index_copy_(0, self._pos_tensor, value.to(self._v.dtype))
 
         # Advance position (wrap around at capacity)
         self._pos_tensor.add_(1)
