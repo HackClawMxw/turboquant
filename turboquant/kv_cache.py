@@ -102,8 +102,23 @@ def dequantize_values(
     vq: ValueQuantized,
     group_size: int = 32,
 ) -> torch.Tensor:
-    """Dequantize value vectors from bit-packed format."""
-    data = unpack_values(vq).float()
+    """Dequantize value vectors from bit-packed or pre-allocated unpacked format.
+
+    Handles two storage formats:
+      - Bit-packed (legacy): data shape (..., packed_d) where packed_d < head_dim
+      - Unpacked (pre-allocated store): data shape (..., head_dim) where each
+        byte holds one quantized value
+    """
+    # Detect format: if data last dim == scales last dim * group_size, it's
+    # already unpacked (pre-allocated flat store).  Otherwise it's bit-packed.
+    expected_unpacked = vq.scales.shape[-1] * group_size
+    if vq.data.shape[-1] == expected_unpacked:
+        # Already unpacked — dequantize directly
+        data = vq.data.float()
+    else:
+        # Bit-packed — unpack first
+        data = unpack_values(vq).float()
+
     d = data.shape[-1]
     batch_shape = data.shape[:-1]
 
