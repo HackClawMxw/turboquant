@@ -201,9 +201,9 @@ class RingBuffer:
         self._pos_tensor.add_(1)
         self._pos_tensor.remainder_(self._capacity_tensor)
 
-        # Advance and clamp count
+        # Advance and clamp count (minimum_ not available in all PyTorch versions)
         self._count_tensor.add_(1)
-        self._count_tensor.minimum_(self._capacity_tensor)
+        torch.minimum(self._count_tensor, self._capacity_tensor, out=self._count_tensor)
 
     def peek_full(self):
         """Return full ring buffer + device count for CUDA-Graph-compatible read.
