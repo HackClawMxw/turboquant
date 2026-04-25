@@ -316,17 +316,17 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
             # safe because this only happens during memory profiling — actual
             # inference uses the T = 1 captured graph.
             if q.shape[0] > 1 and _graph_intended:
-                result_flat = torch.zeros(
+                if output is not None:
+                    output[:num_actual].zero_()
+                    return output
+                if query.dim() == 3:
+                    return torch.zeros_like(query[:num_actual])
+                return torch.zeros(
                     num_actual,
                     state.config.num_query_heads * state.config.head_dim,
                     dtype=query.dtype,
                     device=query.device,
                 )
-                if output is not None:
-                    out_slice = output[:num_actual]
-                    out_slice.copy_(result_flat)
-                    return output
-                return result_flat
 
             flat = state.store.get_flat_cache()
 
@@ -410,17 +410,17 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
             # Same T > 1 shortcut as above (CUDA Graph warmup profiling).
             if q_fb.shape[0] > 1 and _graph_intended:
-                result_flat = torch.zeros(
+                if output is not None:
+                    output[:num_actual].zero_()
+                    return output
+                if query.dim() == 3:
+                    return torch.zeros_like(query[:num_actual])
+                return torch.zeros(
                     num_actual,
                     state.config.num_query_heads * state.config.head_dim,
                     dtype=query.dtype,
                     device=query.device,
                 )
-                if output is not None:
-                    out_slice = output[:num_actual]
-                    out_slice.copy_(result_flat)
-                    return output
-                return result_flat
 
             flat = state.store.get_flat_cache()
             has_history = flat is not None and flat.num_tokens >= MIN_HISTORY_FOR_TQ
