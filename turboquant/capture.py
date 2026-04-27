@@ -126,6 +126,10 @@ class RingBuffer:
 
         self._total_written += num_tokens
 
+        # Keep device-side tensors in sync so CUDA-Graph replay reads
+        # the correct position and count after eager-mode writes.
+        self.sync_device_state()
+
         if overflow_k_parts:
             return (
                 torch.cat(overflow_k_parts, dim=0),
@@ -140,6 +144,7 @@ class RingBuffer:
         k = self._k[: self._pos].clone()
         v = self._v[: self._pos].clone()
         self._pos = 0
+        self.sync_device_state()
         return k, v
 
     def peek(self) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
@@ -178,6 +183,20 @@ class RingBuffer:
     @property
     def graph_ready(self) -> bool:
         return self._graph_mode
+
+    def sync_device_state(self):
+        """Synchronise device-side tensors from Python-side _pos.
+
+        Must be called after any eager-mode write (write(), drain()) that
+        modifies ``_pos`` when ``_graph_mode`` is active.  Without this,
+        the CUDA-Graph replay path reads stale device values for position
+        and count, causing ring buffer data corruption.
+        """
+        if not self._graph_mode:
+            return
+        count = min(self._pos, self.capacity)
+        self._pos_tensor.fill_(self._pos)
+        self._count_tensor.fill_(count)
 
     def write_graph(self, key: torch.Tensor, value: torch.Tensor):
         """CUDA-Graph-compatible write for a single decode token.
@@ -275,16 +294,28 @@ class KVCaptureEngine:
             # Previous request's decode state is still present — new request starting.
             self.reset()
 
-        if num_tokens <= self.ring.capacity:
-            self.ring.write(key[:num_tokens], value[:num_tokens], num_tokens)
+        if self.ring._graph_mode:
+            # CUDA-Graph mode: ALL prefill tokens must go into the
+            # compressed store (via append_chunk → _n_tensor update).
+            # The ring buffer is reserved exclusively for decode tokens
+            # written by write_graph during CUDA-Graph replay.
+            # Keeping prefill out of the ring avoids the dual-state
+            # consistency problem (Python _pos vs device _pos_tensor).
+            self.store.append_chunk(key[:num_tokens], value[:num_tokens])
+            # Ring buffer stays empty — device tensors already at 0.
+            # decode write_graph will start from _pos_tensor=0.
         else:
-            n_compress = num_tokens - self.ring.capacity
-            self.store.append_chunk(key[:n_compress], value[:n_compress])
-            self.ring.write(
-                key[n_compress:num_tokens],
-                value[n_compress:num_tokens],
-                self.ring.capacity,
-            )
+            # Eager mode: split between compressed store and ring buffer.
+            if num_tokens <= self.ring.capacity:
+                self.ring.write(key[:num_tokens], value[:num_tokens], num_tokens)
+            else:
+                n_compress = num_tokens - self.ring.capacity
+                self.store.append_chunk(key[:n_compress], value[:n_compress])
+                self.ring.write(
+                    key[n_compress:num_tokens],
+                    value[n_compress:num_tokens],
+                    self.ring.capacity,
+                )
         self._prefill_done = True
 
     def ingest_prefill_from_paged_cache(
