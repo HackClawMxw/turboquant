@@ -289,6 +289,8 @@ def _compressed_graph(query, flat, store, gqa_ratio, scale, layer_state):
         m_buf=layer_state._m_buf,
         l_buf=layer_state._l_buf,
         n_tensor=store.n_tensor,
+        q_rot=layer_state._q_rot_buf,
+        q_sketch=layer_state._q_sketch_buf,
     )
     out = acc / l.unsqueeze(-1)
     return out.unsqueeze(0).to(query.dtype)
@@ -325,6 +327,8 @@ def _hybrid_graph(query, flat, store, recent_k, recent_v,
         m_buf=layer_state._m_buf,
         l_buf=layer_state._l_buf,
         n_tensor=store.n_tensor,
+        q_rot=layer_state._q_rot_buf,
+        q_sketch=layer_state._q_sketch_buf,
     )
 
     # Recent buffer — read full ring buffer + device count for CUDA-Graph compat

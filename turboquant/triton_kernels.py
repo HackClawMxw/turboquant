@@ -1269,6 +1269,9 @@ def turboquant_fused_decode_graph(
     l_buf: torch.Tensor = None,
     # Device-side N counter
     n_tensor: torch.Tensor = None,
+    # Pre-computed query rotation (avoids redundant matmul)
+    q_rot: torch.Tensor = None,
+    q_sketch: torch.Tensor = None,
 ):
     """CUDA-Graph-compatible fused decode with GQA.
 
@@ -1282,8 +1285,11 @@ def turboquant_fused_decode_graph(
         query = query.squeeze(1)
     QH, D = query.shape
 
-    q_rot = torch.matmul(query.float(), Pi.T)
-    q_sketch = torch.matmul(query.float(), S.T)
+    # Use pre-computed rotations if provided (avoids redundant matmul)
+    if q_rot is None:
+        q_rot = torch.matmul(query.float(), Pi.T)
+    if q_sketch is None:
+        q_sketch = torch.matmul(query.float(), S.T)
 
     mse_packed = quantized_key.mse_indices
     qjl_signs = quantized_key.qjl_signs
