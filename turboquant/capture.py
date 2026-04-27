@@ -290,9 +290,16 @@ class KVCaptureEngine:
 
         key/value: (num_tokens, num_kv_heads, head_dim)
         """
+        print(
+            f"[TQ-PREFILL] layer={self.store.layer_idx} num_tokens={num_tokens} "
+            f"_was_decoding={self._was_decoding} graph_mode={self.ring._graph_mode} "
+            f"store_write_pos_before={self.store._write_pos}",
+            flush=True,
+        )
         if self._was_decoding:
             # Previous request's decode state is still present — new request starting.
             self.reset()
+            print(f"[TQ-PREFILL] layer={self.store.layer_idx} RESET done", flush=True)
 
         if self.ring._graph_mode:
             # CUDA-Graph mode: ALL prefill tokens must go into the
@@ -302,6 +309,12 @@ class KVCaptureEngine:
             # Keeping prefill out of the ring avoids the dual-state
             # consistency problem (Python _pos vs device _pos_tensor).
             self.store.append_chunk(key[:num_tokens], value[:num_tokens])
+            print(
+                f"[TQ-PREFILL] layer={self.store.layer_idx} append_chunk done, "
+                f"store_write_pos={self.store._write_pos} "
+                f"_n_tensor={self.store._n_tensor.item() if self.store._n_tensor is not None else 'None'}",
+                flush=True,
+            )
             # Ring buffer stays empty — device tensors already at 0.
             # decode write_graph will start from _pos_tensor=0.
         else:
