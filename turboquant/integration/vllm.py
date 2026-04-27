@@ -269,6 +269,7 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         if (capture_in_forward
                 and mode not in (MODE_OFF,)
                 and attn_metadata is not None):
+            num_tok = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
             if is_decode or num_tok <= 1:
                 _capture_kv(key, value, attn_metadata, is_decode)
             elif not _graph_intended:
