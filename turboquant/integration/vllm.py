@@ -196,12 +196,20 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
     _diag = {"step": 0}
     _DIAG_MAX_STEPS = 5
 
-    def _capture_kv(key, value, attn_metadata):
+    def _capture_kv(key, value, attn_metadata, is_decode):
         """Capture K/V tensors into TQ store."""
         num_tokens = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
-        if num_tokens <= 1:
+        if is_decode or num_tokens <= 1:
+            # Decode (single or multi-sequence): ring buffer write is
+            # graph-safe.  Multi-sequence decode (num_tokens > 1 but
+            # is_decode=True) also goes through ingest_decode which
+            # handles batched ring writes and overflow correctly.
             state.engine.ingest_decode(key[:num_tokens], value[:num_tokens], num_tokens)
         else:
+            # Prefill (T>1): quantization is graph-safe (pre-allocated
+            # tensors), so this can run during CUDA Graph capture too.
+            # Warmup garbage is reset when actual inference starts
+            # (ingest_prefill detects _was_decoding flag → reset()).
             state.engine.ingest_prefill(key[:num_tokens], value[:num_tokens], num_tokens)
 
     def patched(
@@ -233,31 +241,31 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # Prefill-to-decode transition: compress prefill ring buffer
         # into the store and reset device tensors for graph mode.
-        # Must always drain+compress the prefill data (this is eager mode,
-        # not inside graph capture).  Then additionally reset device tensors
-        # for graph-mode decode.
+        # In EAGER mode (no CUDA Graph): safe to call prepare_for_decode()
+        # which launches CUDA ops.
+        # In GRAPH mode: patched forward also runs during graph capture
+        # warmup.  prepare_for_decode() contains CUDA ops (drain→clone,
+        # append_chunk→quantize, reset_for_graph→fill_) that would be
+        # recorded in the graph and replay every step, resetting device
+        # tensors and preventing the ring buffer from accumulating tokens.
+        # Skip it here; the execute_model hook handles the transition
+        # between graph replays (Python-only, no CUDA ops in the hook).
         if is_decode and not state.engine._was_decoding:
-            # Always compress prefill data into the store
-            state.engine.prepare_for_decode()
-            # Additionally reset device tensors if graph mode is active
-            if _graph_intended and state.engine.ring._graph_mode:
-                state.engine.ring.reset_for_graph()
+            if not _graph_intended:
+                state.engine.prepare_for_decode()
 
         # Capture K/V when no separate kv_update hook exists.
-        # - Decode (T=1): ring buffer write_graph is graph-safe and must be
-        #   captured INTO the CUDA graph for replay.  Always proceed.
-        # - Prefill (T>1): quantization creates new tensors which is forbidden
-        #   during CUDA Graph capture (inside with torch.cuda.graph()).
-        #   Only skip when stream capture is actually active; during eager-
-        #   mode inference prefill, we MUST capture.
+        # - Decode (T=1 or multi-sequence): ring buffer write is graph-safe.
+        # - Prefill (T>1): quantization is graph-safe (all dynamic tensors
+        #   pre-allocated in TurboQuantProd.__init__).  Warmup garbage is
+        #   reset when actual inference starts (ingest_prefill → _was_decoding
+        #   → reset()).
+        # No stream-capture guard needed — is_current_stream_capturing() is
+        # unreliable because vLLM uses low-level CUDA API for capture.
         if (capture_in_forward
                 and mode not in (MODE_OFF,)
                 and attn_metadata is not None):
-            num_tok = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
-            if num_tok <= 1:
-                _capture_kv(key, value, attn_metadata)
-            elif not torch.cuda.is_current_stream_capturing():
-                _capture_kv(key, value, attn_metadata)
+            _capture_kv(key, value, attn_metadata, is_decode)
 
         if should_log:
             torch.cuda.synchronize()
@@ -730,11 +738,26 @@ def install_hooks(
         def _make_tq_execute_hook(orig_fn, states):
             def hooked(*args, **kwargs):
                 result = orig_fn(*args, **kwargs)
-                # Check TQ ring buffer overflow for all graph-ready layers
+                # Post-graph-replay bookkeeping for all graph-ready layers.
+                # IMPORTANT: do NOT launch CUDA ops here during initial graph
+                # capture warmup — they would be recorded in the graph and
+                # replay every step (e.g. reset_for_graph would prevent the
+                # ring buffer from accumulating tokens).  Only use Python
+                # state updates; check_overflow_and_compress launches CUDA
+                # ops but only triggers after `capacity` decode steps, which
+                # never happens during the short capture warmup.
                 for _name, st in states.items():
                     ring = st.engine.ring
                     if ring._graph_mode:
                         ring._cpu_decode_steps += 1
+                        if not st.engine._was_decoding:
+                            # Prefill-to-decode transition (Python-only).
+                            # The prefill ring buffer data is left in place
+                            # and gradually overwritten by decode tokens via
+                            # write_graph.  The first `capacity` decode steps
+                            # see a mix of prefill + decode recent tokens,
+                            # which is acceptable quality-wise.
+                            st.engine._was_decoding = True
                         st.engine.check_overflow_and_compress()
                 return result
             return hooked

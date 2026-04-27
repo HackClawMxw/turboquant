@@ -211,6 +211,14 @@ class TurboQuantProd(torch.nn.Module):
         # QJL dequantization constant
         self.qjl_scale = math.sqrt(math.pi / 2.0) / dim
 
+        # Pre-allocated bit-packing powers — avoids torch.tensor() during
+        # CUDA Graph capture (host→device copy is forbidden during capture).
+        self.register_buffer(
+            "_sign_powers",
+            torch.tensor([1, 2, 4, 8, 16, 32, 64, 128],
+                         device=self.device, dtype=torch.uint8),
+        )
+
     def _pack_qjl_signs(self, projected: torch.Tensor) -> torch.Tensor:
         """Pack sign bits into uint8 (8 signs per byte)."""
         signs = (projected > 0).to(torch.uint8)
@@ -218,13 +226,11 @@ class TurboQuantProd(torch.nn.Module):
         if d % 8 != 0:
             signs = F.pad(signs, (0, 8 - d % 8), value=0)
         signs_reshaped = signs.reshape(*signs.shape[:-1], -1, 8)
-        powers = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=signs.device, dtype=torch.uint8)
-        return (signs_reshaped * powers).sum(dim=-1, dtype=torch.uint8)
+        return (signs_reshaped * self._sign_powers).sum(dim=-1, dtype=torch.uint8)
 
     def _unpack_qjl_signs(self, packed: torch.Tensor) -> torch.Tensor:
         """Unpack sign bits from uint8 to float {-1, +1}."""
-        powers = torch.tensor([1, 2, 4, 8, 16, 32, 64, 128], device=packed.device, dtype=torch.uint8)
-        unpacked = ((packed.unsqueeze(-1) & powers) > 0).float()
+        unpacked = ((packed.unsqueeze(-1) & self._sign_powers) > 0).float()
         signs = unpacked.reshape(*packed.shape[:-1], -1)[..., :self.dim]
         return 2.0 * signs - 1.0
 
