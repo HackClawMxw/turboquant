@@ -326,24 +326,6 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # --- Hybrid decode ---
         if mode == MODE_HYBRID and state.supports_hybrid:
-            # Diagnostic: log first few hybrid decode entries
-            _li = state.config.layer_idx
-            _diag_hybrid = _diag.get("hybrid_logged", 0)
-            if _diag_hybrid < 2:
-                flat_dbg = state.store.get_flat_cache()
-                n_tok = state.store._write_pos
-                n_tensor_val = state.store._n_tensor.item() if state.store._n_tensor is not None else -1
-                ring_cnt = state.engine.ring._count_tensor.item() if state.engine.ring._graph_mode else state.engine.ring._pos
-                print(
-                    f"[TQ-HYBRID] layer={_li} q.shape={q.shape} "
-                    f"store_write_pos={n_tok} _n_tensor={n_tensor_val} "
-                    f"ring_count={ring_cnt} "
-                    f"graph_intended={_graph_intended} "
-                    f"flat={'yes' if flat_dbg else 'no'}",
-                    flush=True,
-                )
-                _diag["hybrid_logged"] = _diag_hybrid + 1
-
             if should_log:
                 torch.cuda.synchronize()
                 t_hybrid_start = time.perf_counter()
@@ -352,6 +334,22 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
             q = query[:num_actual]
             if q.dim() == 2:
                 q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
+
+            # Diagnostic: log first few hybrid decode entries
+            _li = state.config.layer_idx
+            _diag_hybrid = _diag.get("hybrid_logged", 0)
+            if _diag_hybrid < 2:
+                n_tok = state.store._write_pos
+                n_tensor_val = state.store._n_tensor.item() if state.store._n_tensor is not None else -1
+                ring_cnt = state.engine.ring._count_tensor.item() if state.engine.ring._graph_mode else state.engine.ring._pos
+                print(
+                    f"[TQ-HYBRID] layer={_li} q.shape={q.shape} "
+                    f"store_write_pos={n_tok} _n_tensor={n_tensor_val} "
+                    f"ring_count={ring_cnt} "
+                    f"graph_intended={_graph_intended}",
+                    flush=True,
+                )
+                _diag["hybrid_logged"] = _diag_hybrid + 1
 
             # Multi-token decode (T > 1) during CUDA Graph warmup: the graph-
             # compatible Triton kernel only supports T = 1.  Returning zeros is
