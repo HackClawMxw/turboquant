@@ -1293,9 +1293,9 @@ def _turboquant_recent_buffer_kernel(
     cap_val = tl.load(CAP_ptr).to(tl.int32)
     actual_count = tl.minimum(valid_count, cap_val)
 
-    # Query base pointer for per-element loads
-    q_base = Q_ptr + pid_q * stride_q_qh
+    # Load the full query vector once — reused across all blocks
     d_offs = tl.arange(0, D)
+    q = tl.load(Q_ptr + pid_q * stride_q_qh + d_offs * stride_q_d).to(tl.float32)  # (D,)
 
     # Online softmax state
     m_i = tl.zeros([1], dtype=tl.float32) - float("inf")
@@ -1307,18 +1307,15 @@ def _turboquant_recent_buffer_kernel(
         n_offs = block_start + tl.arange(0, BLOCK_N)
         n_mask = n_offs < actual_count
 
-        # Load bf16 keys and cast to float32: (BLOCK_N, D)
+        # Load full key block: (BLOCK_N, D) — single coalesced load
         k_bf16 = tl.load(
             RING_K_ptr + n_offs[:, None] * stride_k_cap + pid_kv * stride_k_h + d_offs[None, :] * stride_k_d,
             mask=n_mask[:, None], other=0,
         )
         k_f32 = k_bf16.to(tl.float32)
 
-        # Compute dot product with query: (BLOCK_N,)
-        scores = tl.zeros([BLOCK_N], dtype=tl.float32)
-        for d_idx in range(D):
-            q_val = tl.load(q_base + d_idx * stride_q_d).to(tl.float32)
-            scores += q_val * k_f32[:, d_idx]
+        # Vectorized dot product: broadcast q (D,) * k (BLOCK_N, D) -> sum over D -> (BLOCK_N,)
+        scores = tl.sum(q[None, :] * k_f32, axis=1)
         scores = scores * SM_SCALE
         scores = tl.where(n_mask, scores, float("-inf"))
 
