@@ -247,15 +247,16 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
         # - Decode (T=1): ring buffer write_graph is graph-safe and must be
         #   captured INTO the CUDA graph for replay.  Always proceed.
         # - Prefill (T>1): quantization creates new tensors which is forbidden
-        #   during CUDA Graph capture.  Use _graph_intended (more reliable than
-        #   is_current_stream_capturing which fails on non-default streams).
+        #   during CUDA Graph capture (inside with torch.cuda.graph()).
+        #   Only skip when stream capture is actually active; during eager-
+        #   mode inference prefill, we MUST capture.
         if (capture_in_forward
                 and mode not in (MODE_OFF,)
                 and attn_metadata is not None):
             num_tok = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
             if num_tok <= 1:
                 _capture_kv(key, value, attn_metadata)
-            elif not _graph_intended:
+            elif not torch.cuda.is_current_stream_capturing():
                 _capture_kv(key, value, attn_metadata)
 
         if should_log:
