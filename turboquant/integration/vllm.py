@@ -199,9 +199,9 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
     def _capture_kv(key, value, attn_metadata, is_decode):
         """Capture K/V tensors into TQ store."""
         num_tokens = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
-        # Diagnostic: log first capture per layer
-        _li = state.config.layer_idx
-        if state._log_count < 3:
+        # Diagnostic: log first capture per layer (skip during graph capture)
+        if not state.graph_intended and state._log_count < 3:
+            _li = state.config.layer_idx
             print(
                 f"[TQ-CAPTURE] layer={_li} is_decode={is_decode} "
                 f"num_tokens={num_tokens} _was_decoding={state.engine._was_decoding} "
@@ -336,9 +336,10 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                 q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
 
             # Diagnostic: log first few hybrid decode entries
+            # Must NOT use .item() during graph capture (forces CUDA sync)
             _li = state.config.layer_idx
             _diag_hybrid = _diag.get("hybrid_logged", 0)
-            if _diag_hybrid < 2:
+            if not _graph_intended and _diag_hybrid < 2:
                 n_tok = state.store._write_pos
                 n_tensor_val = state.store._n_tensor.item() if state.store._n_tensor is not None else -1
                 ring_cnt = state.engine.ring._count_tensor.item() if state.engine.ring._graph_mode else state.engine.ring._pos

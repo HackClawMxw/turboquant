@@ -311,8 +311,7 @@ class KVCaptureEngine:
             self.store.append_chunk(key[:num_tokens], value[:num_tokens])
             print(
                 f"[TQ-PREFILL] layer={self.store.layer_idx} append_chunk done, "
-                f"store_write_pos={self.store._write_pos} "
-                f"_n_tensor={self.store._n_tensor.item() if self.store._n_tensor is not None else 'None'}",
+                f"store_write_pos={self.store._write_pos}",
                 flush=True,
             )
             # Ring buffer stays empty — device tensors already at 0.
