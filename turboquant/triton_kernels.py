@@ -978,8 +978,8 @@ def _turboquant_fused_decode_gqa_kernel(
 
     # Store unnormalised output + softmax state
     tl.store(OUT_ptr + pid_q * stride_o_qh + d_offs * stride_o_d, acc)
-    tl.store(M_OUT_ptr + pid_q * stride_m_qh, m_i)
-    tl.store(L_OUT_ptr + pid_q * stride_l_qh, l_i)
+    tl.store(M_OUT_ptr + pid_q * stride_m_qh, tl.sum(m_i))
+    tl.store(L_OUT_ptr + pid_q * stride_l_qh, tl.sum(l_i))
 
 
 def turboquant_fused_decode_gqa(
@@ -1247,8 +1247,8 @@ def _turboquant_fused_decode_graph_kernel(
         block_idx += 1
 
     tl.store(OUT_ptr + pid_q * stride_o_qh + d_offs * stride_o_d, acc)
-    tl.store(M_OUT_ptr + pid_q * stride_m_qh, m_i)
-    tl.store(L_OUT_ptr + pid_q * stride_l_qh, l_i)
+    tl.store(M_OUT_ptr + pid_q * stride_m_qh, tl.sum(m_i))
+    tl.store(L_OUT_ptr + pid_q * stride_l_qh, tl.sum(l_i))
 
 
 def turboquant_fused_decode_graph(
