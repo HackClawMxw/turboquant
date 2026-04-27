@@ -764,6 +764,7 @@ def install_hooks(
             _transitions_seen = 0
 
             def hooked(*args, **kwargs):
+                nonlocal _transitions_seen
                 result = orig_fn(*args, **kwargs)
                 for _name, st in states.items():
                     ring = st.engine.ring
