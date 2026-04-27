@@ -256,16 +256,36 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # Capture K/V when no separate kv_update hook exists.
         # - Decode (T=1 or multi-sequence): ring buffer write is graph-safe.
-        # - Prefill (T>1): quantization is graph-safe (all dynamic tensors
-        #   pre-allocated in TurboQuantProd.__init__).  Warmup garbage is
-        #   reset when actual inference starts (ingest_prefill → _was_decoding
-        #   → reset()).
-        # No stream-capture guard needed — is_current_stream_capturing() is
-        # unreliable because vLLM uses low-level CUDA API for capture.
+        #   Always capture directly — write_graph CUDA ops are the ONLY ops
+        #   we want recorded in the decode graph.
+        # - Prefill (T>1, eager mode / not graph-intended): safe to quantize
+        #   directly.  No CUDA Graph is active.
+        # - Prefill (T>1, graph-intended): the patched forward ALSO runs during
+        #   CUDA Graph capture warmup.  If we run quantization here, the CUDA
+        #   ops are recorded in the graph and replay every decode step —
+        #   overwriting the store with warmup garbage and corrupting _n_tensor.
+        #   Instead, save K/V for deferred capture in the execute_model hook,
+        #   which processes them AFTER graph capture is complete (eager mode).
         if (capture_in_forward
                 and mode not in (MODE_OFF,)
                 and attn_metadata is not None):
-            _capture_kv(key, value, attn_metadata, is_decode)
+            if is_decode or num_tok <= 1:
+                _capture_kv(key, value, attn_metadata, is_decode)
+            elif not _graph_intended:
+                # Eager mode (no CUDA Graph): quantize directly
+                _capture_kv(key, value, attn_metadata, is_decode)
+            else:
+                # Graph mode: defer prefill capture to execute_model hook.
+                # Clone is a CUDA op but harmless if recorded — the result
+                # tensor is only used by Python code that doesn't run during
+                # graph replay.
+                state._pending_prefill_kv = (
+                    key[:num_tok].clone(),
+                    value[:num_tok].clone(),
+                )
+                # Signal the hook that a prefill happened, so it can
+                # reset _was_decoding and detect the transition.
+                state._need_prefill_reset = True
 
         if should_log:
             torch.cuda.synchronize()
@@ -736,28 +756,42 @@ def install_hooks(
     _orig_execute_model = getattr(model_runner, 'execute_model', None)
     if _orig_execute_model is not None and not getattr(model_runner, '_tq_execute_patched', False):
         def _make_tq_execute_hook(orig_fn, states):
+            # Track how many prefill-to-decode transitions we've seen.
+            # The FIRST transition is during CUDA Graph capture warmup
+            # (where we must NOT launch CUDA ops).  All subsequent
+            # transitions are during actual inference (safe to launch ops).
+            _transitions_seen = 0
+
             def hooked(*args, **kwargs):
                 result = orig_fn(*args, **kwargs)
-                # Post-graph-replay bookkeeping for all graph-ready layers.
-                # IMPORTANT: do NOT launch CUDA ops here during initial graph
-                # capture warmup — they would be recorded in the graph and
-                # replay every step (e.g. reset_for_graph would prevent the
-                # ring buffer from accumulating tokens).  Only use Python
-                # state updates; check_overflow_and_compress launches CUDA
-                # ops but only triggers after `capacity` decode steps, which
-                # never happens during the short capture warmup.
                 for _name, st in states.items():
                     ring = st.engine.ring
                     if ring._graph_mode:
                         ring._cpu_decode_steps += 1
+
+                        # Handle prefill-reset signal from patched forward.
+                        # The forward sets this flag when it defers prefill
+                        # KV to the hook.  It tells us to reset _was_decoding
+                        # so we can detect the transition on this call.
+                        if getattr(st, '_need_prefill_reset', False):
+                            st.engine._was_decoding = False
+                            st._need_prefill_reset = False
+
                         if not st.engine._was_decoding:
-                            # Prefill-to-decode transition (Python-only).
-                            # The prefill ring buffer data is left in place
-                            # and gradually overwritten by decode tokens via
-                            # write_graph.  The first `capacity` decode steps
-                            # see a mix of prefill + decode recent tokens,
-                            # which is acceptable quality-wise.
+                            # Prefill-to-decode transition detected.
                             st.engine._was_decoding = True
+                            _transitions_seen += 1
+
+                            # Deferred prefill capture: process K/V that was
+                            # saved by patched forward.  Skip the FIRST
+                            # transition (during capture warmup) to avoid
+                            # recording quantization CUDA ops in the graph.
+                            if (_transitions_seen >= 2
+                                    and getattr(st, '_pending_prefill_kv', None) is not None):
+                                k, v = st._pending_prefill_kv
+                                st.engine.ingest_prefill(k, v, k.shape[0])
+                                st._pending_prefill_kv = None
+
                         st.engine.check_overflow_and_compress()
                 return result
             return hooked
