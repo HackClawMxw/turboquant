@@ -96,6 +96,14 @@ def preallocate_layer(state, max_tokens: int):
     state._q_rot_buf = torch.zeros(Q, D, device=dev, dtype=torch.float32)
     state._q_sketch_buf = torch.zeros(Q, D, device=dev, dtype=torch.float32)
 
+    # Pre-allocated buffers for recent-buffer attention output
+    state._acc_r_buf = torch.zeros(Q, D, device=dev, dtype=torch.float32)
+    state._m_r_buf = torch.zeros(Q, device=dev, dtype=torch.float32)
+    state._l_r_buf = torch.zeros(Q, device=dev, dtype=torch.float32)
+
+    # Pre-allocated output buffer for hybrid merge
+    state._merge_out_buf = torch.zeros(Q, D, device=dev, dtype=torch.float32)
+
     # Pre-allocate ring buffer device tensors for CUDA-Graph-compatible writes
     state.engine.ring.preallocate_graph_buffers()
 
@@ -298,17 +306,19 @@ def _compressed_graph(query, flat, store, gqa_ratio, scale, layer_state):
 
 def _hybrid_graph(query, flat, store, recent_k, recent_v,
                   gqa_ratio, num_kv_heads, scale, layer_state):
-    from turboquant.triton_kernels import turboquant_fused_decode_graph
+    from turboquant.triton_kernels import (
+        turboquant_fused_decode_graph,
+        turboquant_recent_buffer_decode,
+        turboquant_hybrid_merge,
+    )
 
     T, Q, D = query.shape
-    H_kv = num_kv_heads
-    G = gqa_ratio
     quantizer = store.quantizer
     ring = layer_state.engine.ring
 
     q = query.squeeze(0).float()
 
-    # Fused kernel on compressed KV
+    # Phase 1: Fused kernel on compressed KV
     torch.matmul(q, quantizer.mse_quantizer.Pi.T, out=layer_state._q_rot_buf)
     torch.matmul(q, quantizer.S.T, out=layer_state._q_sketch_buf)
 
@@ -331,44 +341,50 @@ def _hybrid_graph(query, flat, store, recent_k, recent_v,
         q_sketch=layer_state._q_sketch_buf,
     )
 
-    # Recent buffer — read full ring buffer + device count for CUDA-Graph compat
+    # Phase 2: Fused Triton kernel on recent buffer (zero allocation)
     if ring.graph_ready:
         ring_k, ring_v, count_tensor, arange_buf, cap_tensor = ring.peek_full()
-        cap = ring.capacity
-        k_r = ring_k.transpose(0, 1).float()  # (H_kv, cap, D)
-        v_r = ring_v.transpose(0, 1).float()
 
-        q_g = q.view(H_kv, G, D)
-        scores_r = torch.bmm(q_g, k_r.transpose(1, 2)).reshape(Q, cap)
+        acc_r, m_r, l_r = turboquant_recent_buffer_decode(
+            query=q,
+            ring_k=ring_k,
+            ring_v=ring_v,
+            count_tensor=count_tensor,
+            arange_buf=arange_buf,
+            cap_tensor=cap_tensor,
+            sm_scale=scale,
+            gqa_ratio=gqa_ratio,
+            acc_buf=layer_state._acc_r_buf,
+            m_buf=layer_state._m_r_buf,
+            l_buf=layer_state._l_r_buf,
+        )
 
-        # Mask invalid entries (entries beyond count are stale)
-        valid_count = torch.minimum(count_tensor, cap_tensor)
-        mask = arange_buf < valid_count  # (cap,) bool
-        scores_r = scores_r.masked_fill(~mask.unsqueeze(0), float('-inf'))
+        # Phase 3: Fused Triton merge kernel
+        out = turboquant_hybrid_merge(
+            acc_c=acc_c, m_c=m_c, l_c=l_c,
+            acc_r=acc_r, m_r=m_r, l_r=l_r,
+            out_buf=layer_state._merge_out_buf,
+        )
+        return out.unsqueeze(0).to(query.dtype)
 
-        m_r = scores_r.max(dim=-1).values
-        p_r = torch.exp(scores_r - m_r.unsqueeze(-1))
-        l_r = p_r.sum(dim=-1)
-        acc_r = torch.bmm(p_r.view(H_kv, G, cap), v_r).reshape(Q, D)
-    else:
-        # Non-graph fallback (shouldn't normally be called, but safe)
-        N_recent = recent_k.shape[0]
-        q_g = q.view(H_kv, G, D)
-        k_r = recent_k.transpose(0, 1).float()
-        v_r = recent_v.transpose(0, 1).float()
-        scores_r = torch.bmm(q_g, k_r.transpose(1, 2)).reshape(Q, N_recent)
-        m_r = scores_r.max(dim=-1).values
-        p_r = torch.exp(scores_r - m_r.unsqueeze(-1))
-        l_r = p_r.sum(dim=-1)
-        acc_r = torch.bmm(p_r.view(H_kv, G, N_recent), v_r).reshape(Q, D)
+    # Non-graph fallback: PyTorch for recent buffer + merge
+    H_kv = num_kv_heads
+    G = gqa_ratio
+    N_recent = recent_k.shape[0]
+    k_r = recent_k.transpose(0, 1).float()
+    v_r = recent_v.transpose(0, 1).float()
+    q_g = q.view(H_kv, G, D)
+    scores_r = torch.bmm(q_g, k_r.transpose(1, 2)).reshape(Q, N_recent)
+    m_r = scores_r.max(dim=-1).values
+    p_r = torch.exp(scores_r - m_r.unsqueeze(-1))
+    l_r = p_r.sum(dim=-1)
+    acc_r = torch.bmm(p_r.view(H_kv, G, N_recent), v_r).reshape(Q, D)
 
-    # Online softmax merge
     m = torch.maximum(m_c, m_r)
     alpha_c = torch.exp(m_c - m)
     alpha_r = torch.exp(m_r - m)
     l_merged = l_c * alpha_c + l_r * alpha_r
     acc_merged = acc_c * alpha_c.unsqueeze(-1) + acc_r * alpha_r.unsqueeze(-1)
-
     out = acc_merged / l_merged.unsqueeze(-1)
     return out.unsqueeze(0).to(query.dtype)
 

@@ -1251,6 +1251,226 @@ def _turboquant_fused_decode_graph_kernel(
     tl.store(L_OUT_ptr + pid_q * stride_l_qh, tl.sum(l_i))
 
 
+# ─── Fused recent-buffer decode kernel ────────────────────────────────
+#
+# Computes attention over a ring buffer of exact (non-quantized) KV pairs.
+# Each program handles one query head, iterates over the ring buffer in
+# blocks, applies count-based masking, online softmax, and value
+# accumulation.  Reads bf16 ring buffer directly, casts to float32
+# on-the-fly — no host-side tensor allocation.
+#
+
+@triton.jit
+def _turboquant_recent_buffer_kernel(
+    Q_ptr,            # (QH, D) float32 query
+    RING_K_ptr,       # (cap, H_kv, D) bf16 ring buffer keys
+    RING_V_ptr,       # (cap, H_kv, D) bf16 ring buffer values
+    COUNT_ptr,        # (1,) int64 — valid entry count
+    ARANGE_ptr,       # (cap,) int64 — [0, 1, ..., cap-1]
+    CAP_ptr,          # (1,) int64 — ring buffer capacity
+    OUT_ACC_ptr,      # (QH, D) float32 — output accumulator
+    OUT_M_ptr,        # (QH,) float32 — output max
+    OUT_L_ptr,        # (QH,) float32 — output sum-exp
+    # --- strides ---
+    stride_q_qh, stride_q_d,
+    stride_k_cap, stride_k_h, stride_k_d,
+    stride_v_cap, stride_v_h, stride_v_d,
+    stride_o_qh, stride_o_d,
+    stride_m_qh,
+    stride_l_qh,
+    # --- constexpr dims ---
+    D: tl.constexpr,
+    CAP: tl.constexpr,
+    GQA_RATIO: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    SM_SCALE,
+):
+    pid_q = tl.program_id(0)
+    pid_kv = pid_q // GQA_RATIO
+
+    # Read valid count from device memory
+    valid_count = tl.load(COUNT_ptr).to(tl.int32)
+    cap_val = tl.load(CAP_ptr).to(tl.int32)
+    actual_count = tl.minimum(valid_count, cap_val)
+
+    # Query base pointer for per-element loads
+    q_base = Q_ptr + pid_q * stride_q_qh
+    d_offs = tl.arange(0, D)
+
+    # Online softmax state
+    m_i = tl.zeros([1], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([1], dtype=tl.float32)
+    acc = tl.zeros([D], dtype=tl.float32)
+
+    # Iterate over ring buffer in blocks
+    for block_start in range(0, CAP, BLOCK_N):
+        n_offs = block_start + tl.arange(0, BLOCK_N)
+        n_mask = n_offs < actual_count
+
+        # Load bf16 keys and cast to float32: (BLOCK_N, D)
+        k_bf16 = tl.load(
+            RING_K_ptr + n_offs[:, None] * stride_k_cap + pid_kv * stride_k_h + d_offs[None, :] * stride_k_d,
+            mask=n_mask[:, None], other=0,
+        )
+        k_f32 = k_bf16.to(tl.float32)
+
+        # Compute dot product with query: (BLOCK_N,)
+        scores = tl.zeros([BLOCK_N], dtype=tl.float32)
+        for d_idx in range(D):
+            q_val = tl.load(q_base + d_idx * stride_q_d).to(tl.float32)
+            scores += q_val * k_f32[:, d_idx]
+        scores = scores * SM_SCALE
+        scores = tl.where(n_mask, scores, float("-inf"))
+
+        # Online softmax update
+        m_new = tl.maximum(m_i, tl.max(scores, 0))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(scores - m_new)
+        l_i = l_i * alpha + tl.sum(p, 0)
+        acc = acc * alpha
+
+        # Load bf16 values and cast to float32: (BLOCK_N, D)
+        v_bf16 = tl.load(
+            RING_V_ptr + n_offs[:, None] * stride_v_cap + pid_kv * stride_v_h + d_offs[None, :] * stride_v_d,
+            mask=n_mask[:, None], other=0,
+        )
+        v_f32 = v_bf16.to(tl.float32)
+
+        # Weighted accumulation
+        acc += tl.sum(p[:, None] * v_f32, 0)
+        m_i = m_new
+
+    tl.store(OUT_ACC_ptr + pid_q * stride_o_qh + d_offs * stride_o_d, acc)
+    tl.store(OUT_M_ptr + pid_q * stride_m_qh, tl.sum(m_i))
+    tl.store(OUT_L_ptr + pid_q * stride_l_qh, tl.sum(l_i))
+
+
+def turboquant_recent_buffer_decode(
+    query: torch.Tensor,       # (QH, D) float32
+    ring_k: torch.Tensor,      # (cap, H_kv, D) bf16
+    ring_v: torch.Tensor,      # (cap, H_kv, D) bf16
+    count_tensor: torch.Tensor, # (1,) int64
+    arange_buf: torch.Tensor,  # (cap,) int64
+    cap_tensor: torch.Tensor,  # (1,) int64
+    sm_scale: float,
+    gqa_ratio: int,
+    # Pre-allocated output buffers
+    acc_buf: torch.Tensor = None,
+    m_buf: torch.Tensor = None,
+    l_buf: torch.Tensor = None,
+):
+    """Fused recent-buffer attention using Triton.
+
+    Computes attention scores between query and ring buffer KV pairs,
+    applies count-based masking, online softmax, and value accumulation
+    in a single kernel.  No intermediate tensor allocations.
+
+    Returns (acc, m, l) into pre-allocated buffers.
+    """
+    QH, D = query.shape
+    cap = ring_k.shape[0]
+
+    if acc_buf is None:
+        acc_buf = torch.zeros(QH, D, device=query.device, dtype=torch.float32)
+    if m_buf is None:
+        m_buf = torch.zeros(QH, device=query.device, dtype=torch.float32)
+    if l_buf is None:
+        l_buf = torch.zeros(QH, device=query.device, dtype=torch.float32)
+
+    acc_buf.zero_()
+    m_buf.fill_(float("-inf"))
+    l_buf.zero_()
+
+    BLOCK_N = 32
+
+    grid = (QH,)
+
+    _turboquant_recent_buffer_kernel[grid](
+        query, ring_k, ring_v,
+        count_tensor, arange_buf, cap_tensor,
+        acc_buf, m_buf, l_buf,
+        query.stride(0), query.stride(1),
+        ring_k.stride(0), ring_k.stride(1), ring_k.stride(2),
+        ring_v.stride(0), ring_v.stride(1), ring_v.stride(2),
+        acc_buf.stride(0), acc_buf.stride(1),
+        m_buf.stride(0),
+        l_buf.stride(0),
+        D=D, CAP=cap, GQA_RATIO=gqa_ratio,
+        BLOCK_N=BLOCK_N, SM_SCALE=sm_scale,
+    )
+
+    return acc_buf, m_buf, l_buf
+
+
+# ─── Hybrid merge kernel ─────────────────────────────────────────────
+
+@triton.jit
+def _turboquant_hybrid_merge_kernel(
+    ACC_C_ptr,    # (QH, D) float32
+    M_C_ptr,      # (QH,) float32
+    L_C_ptr,      # (QH,) float32
+    ACC_R_ptr,    # (QH, D) float32
+    M_R_ptr,      # (QH,) float32
+    L_R_ptr,      # (QH,) float32
+    OUT_ptr,      # (QH, D) float32 output
+    stride_a_qh, stride_a_d,
+    stride_m_qh,
+    stride_l_qh,
+    stride_o_qh, stride_o_d,
+    D: tl.constexpr,
+):
+    pid_q = tl.program_id(0)
+    d_offs = tl.arange(0, D)
+
+    m_c = tl.load(M_C_ptr + pid_q * stride_m_qh)
+    l_c = tl.load(L_C_ptr + pid_q * stride_l_qh)
+    m_r = tl.load(M_R_ptr + pid_q * stride_m_qh)
+    l_r = tl.load(L_R_ptr + pid_q * stride_l_qh)
+
+    m_merged = tl.maximum(m_c, m_r)
+    alpha_c = tl.exp(m_c - m_merged)
+    alpha_r = tl.exp(m_r - m_merged)
+    l_merged = l_c * alpha_c + l_r * alpha_r
+
+    acc_c = tl.load(ACC_C_ptr + pid_q * stride_a_qh + d_offs * stride_a_d)
+    acc_r = tl.load(ACC_R_ptr + pid_q * stride_a_qh + d_offs * stride_a_d)
+
+    acc_merged = acc_c * alpha_c + acc_r * alpha_r
+    out = acc_merged / l_merged
+
+    tl.store(OUT_ptr + pid_q * stride_o_qh + d_offs * stride_o_d, out)
+
+
+def turboquant_hybrid_merge(
+    acc_c: torch.Tensor,
+    m_c: torch.Tensor,
+    l_c: torch.Tensor,
+    acc_r: torch.Tensor,
+    m_r: torch.Tensor,
+    l_r: torch.Tensor,
+    out_buf: torch.Tensor = None,
+) -> torch.Tensor:
+    """Merge online softmax states from compressed and recent attention."""
+    QH, D = acc_c.shape
+
+    if out_buf is None:
+        out_buf = torch.zeros(QH, D, device=acc_c.device, dtype=torch.float32)
+
+    grid = (QH,)
+    _turboquant_hybrid_merge_kernel[grid](
+        acc_c, m_c, l_c,
+        acc_r, m_r, l_r,
+        out_buf,
+        acc_c.stride(0), acc_c.stride(1),
+        m_c.stride(0),
+        l_c.stride(0),
+        out_buf.stride(0), out_buf.stride(1),
+        D=D,
+    )
+
+    return out_buf
+
+
 def turboquant_fused_decode_graph(
     query: torch.Tensor,
     quantized_key,
