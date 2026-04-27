@@ -389,14 +389,14 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
                 result_flat = result.reshape(
                     num_actual, state.config.num_query_heads * state.config.head_dim
-                ).to(query.dtype)
+                )
 
                 if output is not None:
                     out_slice = output[:num_actual]
                     if out_slice.dim() == 3:
-                        out_slice.copy_(result.to(out_slice.dtype))
+                        out_slice.copy_(result)
                     else:
-                        out_slice.copy_(result_flat.to(out_slice.dtype))
+                        out_slice.copy_(result_flat)
                     if should_log:
                         torch.cuda.synchronize()
                         _diag["step"] += 1
@@ -414,7 +414,7 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                         )
                     return output
                 if query.dim() == 3:
-                    return result.to(query.dtype)
+                    return result
                 return result_flat
 
         # Fallback to flash
@@ -469,14 +469,14 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
                 result_flat = result.reshape(
                     num_actual, state.config.num_query_heads * state.config.head_dim
-                ).to(query.dtype)
+                )
 
                 if output is not None:
                     out_slice = output[:num_actual]
                     if out_slice.dim() == 3:
-                        out_slice.copy_(result.to(out_slice.dtype))
+                        out_slice.copy_(result)
                     else:
-                        out_slice.copy_(result_flat.to(out_slice.dtype))
+                        out_slice.copy_(result_flat)
                     if should_log:
                         torch.cuda.synchronize()
                         _diag["step"] += 1
@@ -490,7 +490,7 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
                         )
                     return output
                 if query.dim() == 3:
-                    return result.to(query.dtype)
+                    return result
                 return result_flat
 
             # No KV data at all (very first decode before ring is populated).
@@ -769,6 +769,18 @@ def install_hooks(
                                 k, v = st._pending_prefill_kv
                                 st.engine.ingest_prefill(k, v, k.shape[0])
                                 st._pending_prefill_kv = None
+
+                                # After ingest_prefill fills the ring buffer,
+                                # _pos_tensor may equal capacity, causing an
+                                # out-of-bounds write on the next graph replay
+                                # (index_copy_ with index == tensor size).
+                                # Wrap position to 0 and reset the warmup-
+                                # contaminated decode step counter.
+                                if ring._pos >= ring.capacity:
+                                    ring._pos = 0
+                                    ring._pos_tensor.fill_(0)
+                                    ring._count_tensor.fill_(ring.capacity)
+                                ring._cpu_decode_steps = 0
 
                         st.engine.check_overflow_and_compress()
                 return result
