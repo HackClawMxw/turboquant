@@ -233,14 +233,15 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # Prefill-to-decode transition: compress prefill ring buffer
         # into the store and reset device tensors for graph mode.
-        # When graph is intended, only reset device tensors (skip heavy ops
-        # like drain/quantize that are incompatible with CUDA Graph capture).
+        # Must always drain+compress the prefill data (this is eager mode,
+        # not inside graph capture).  Then additionally reset device tensors
+        # for graph-mode decode.
         if is_decode and not state.engine._was_decoding:
-            if _graph_intended:
-                if state.engine.ring._graph_mode:
-                    state.engine.ring.reset_for_graph()
-            else:
-                state.engine.prepare_for_decode()
+            # Always compress prefill data into the store
+            state.engine.prepare_for_decode()
+            # Additionally reset device tensors if graph mode is active
+            if _graph_intended and state.engine.ring._graph_mode:
+                state.engine.ring.reset_for_graph()
 
         # Capture K/V when no separate kv_update hook exists.
         # - Decode (T=1): ring buffer write_graph is graph-safe and must be
