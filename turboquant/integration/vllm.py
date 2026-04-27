@@ -199,18 +199,6 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
     def _capture_kv(key, value, attn_metadata, is_decode):
         """Capture K/V tensors into TQ store."""
         num_tokens = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
-        # Diagnostic: log first capture per layer (skip during graph capture)
-        if not state.graph_intended and state._log_count < 3:
-            _li = state.config.layer_idx
-            print(
-                f"[TQ-CAPTURE] layer={_li} is_decode={is_decode} "
-                f"num_tokens={num_tokens} _was_decoding={state.engine._was_decoding} "
-                f"store_write_pos={state.store._write_pos} "
-                f"ring_pos={state.engine.ring._pos} "
-                f"graph_mode={state.engine.ring._graph_mode}",
-                flush=True,
-            )
-            state._log_count += 1
         if is_decode or num_tokens <= 1:
             # Decode (single or multi-sequence): ring buffer write is
             # graph-safe.  Multi-sequence decode (num_tokens > 1 but
@@ -253,22 +241,33 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
 
         # Capture K/V when no separate kv_update hook exists.
         #
-        # Key insight: vLLM's CUDA Graph only captures the decode (T=1)
-        # forward pass.  Prefill (T>1) ALWAYS runs in eager mode, even
-        # when graph capture is "intended".  So it is always safe to
-        # quantize prefill KV directly — no graph is active.
+        # Decode (T=1): write_graph CUDA ops are the ONLY ops we want
+        # recorded in the decode graph.  Always safe to call.
         #
-        # For decode (T=1): the write_graph CUDA op is the ONLY op we
-        # want recorded in the decode graph.
+        # Prefill (T>1) in EAGER mode (no CUDA Graph): safe to quantize
+        # directly.
         #
-        # ingest_prefill (capture.py) handles the warmup-data problem:
-        # on the first REAL prefill, it detects _was_decoding=True (set
-        # by warmup decode) and calls reset() to clear warmup garbage
-        # from the store before writing real data.
+        # Prefill (T>1) in GRAPH-INTENDED mode: vLLM's _dummy_run may
+        # call the forward inside a torch.cuda.graph() context for
+        # piecewise capture or profiling.  Running quantization here
+        # would record CUDA ops in the graph that replay incorrectly
+        # on every decode step.  Defer to the execute_model hook which
+        # runs in eager mode between graph replays.
         if (capture_in_forward
                 and mode not in (MODE_OFF,)
                 and attn_metadata is not None):
-            _capture_kv(key, value, attn_metadata, is_decode)
+            num_tok = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
+            if is_decode or num_tok <= 1:
+                _capture_kv(key, value, attn_metadata, is_decode)
+            elif not _graph_intended:
+                _capture_kv(key, value, attn_metadata, is_decode)
+            else:
+                # Graph-intended: defer prefill to execute_model hook
+                state._pending_prefill_kv = (
+                    key[:num_tok].clone(),
+                    value[:num_tok].clone(),
+                )
+                state._need_prefill_reset = True
 
         if should_log:
             torch.cuda.synchronize()
@@ -334,23 +333,6 @@ def _make_patched_forward(orig_fn, state: LayerState, no_alloc: bool = False,
             q = query[:num_actual]
             if q.dim() == 2:
                 q = q.view(num_actual, state.config.num_query_heads, state.config.head_dim)
-
-            # Diagnostic: log first few hybrid decode entries
-            # Must NOT use .item() during graph capture (forces CUDA sync)
-            _li = state.config.layer_idx
-            _diag_hybrid = _diag.get("hybrid_logged", 0)
-            if not _graph_intended and _diag_hybrid < 2:
-                n_tok = state.store._write_pos
-                n_tensor_val = state.store._n_tensor.item() if state.store._n_tensor is not None else -1
-                ring_cnt = state.engine.ring._count_tensor.item() if state.engine.ring._graph_mode else state.engine.ring._pos
-                print(
-                    f"[TQ-HYBRID] layer={_li} q.shape={q.shape} "
-                    f"store_write_pos={n_tok} _n_tensor={n_tensor_val} "
-                    f"ring_count={ring_cnt} "
-                    f"graph_intended={_graph_intended}",
-                    flush=True,
-                )
-                _diag["hybrid_logged"] = _diag_hybrid + 1
 
             # Multi-token decode (T > 1) during CUDA Graph warmup: the graph-
             # compatible Triton kernel only supports T = 1.  Returning zeros is
@@ -756,12 +738,38 @@ def install_hooks(
     _orig_execute_model = getattr(model_runner, 'execute_model', None)
     if _orig_execute_model is not None and not getattr(model_runner, '_tq_execute_patched', False):
         def _make_tq_execute_hook(orig_fn, states):
+            # Track prefill-to-decode transitions to distinguish
+            # warmup (skip) from real inference (process deferred KV).
+            _transitions_seen = 0
+
             def hooked(*args, **kwargs):
+                nonlocal _transitions_seen
                 result = orig_fn(*args, **kwargs)
                 for _name, st in states.items():
                     ring = st.engine.ring
                     if ring._graph_mode:
                         ring._cpu_decode_steps += 1
+
+                        # Handle prefill-reset signal from patched forward.
+                        if getattr(st, '_need_prefill_reset', False):
+                            st.engine._was_decoding = False
+                            st._need_prefill_reset = False
+
+                        if not st.engine._was_decoding:
+                            # Prefill-to-decode transition.
+                            st.engine._was_decoding = True
+                            _transitions_seen += 1
+
+                            # Process deferred prefill KV.  Skip the FIRST
+                            # transition (during warmup/capture) — the data
+                            # is fake and the store will be reset on the
+                            # next real prefill anyway.
+                            if (_transitions_seen >= 2
+                                    and getattr(st, '_pending_prefill_kv', None) is not None):
+                                k, v = st._pending_prefill_kv
+                                st.engine.ingest_prefill(k, v, k.shape[0])
+                                st._pending_prefill_kv = None
+
                         st.engine.check_overflow_and_compress()
                 return result
             return hooked
