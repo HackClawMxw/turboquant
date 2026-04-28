@@ -161,8 +161,11 @@ def enable_no_alloc(
             # so skipping do_kv_cache_update for shared layers is safe.
             static_ctx = worker.model_runner.compilation_config.static_forward_context
             flash_layers = [
-                name for name, state in tq_states.items()
-                if getattr(state, "supports_hybrid", False)
+                name for name, pool_or_state in tq_states.items()
+                if getattr(
+                    pool_or_state.slots[0] if hasattr(pool_or_state, 'slots') else pool_or_state,
+                    "supports_hybrid", False,
+                )
             ]
             shared_layer_names = []
             if len(flash_layers) > 1:
@@ -232,9 +235,15 @@ def free_kv_cache(model_runner):
     freed = 0
     tiny = torch.zeros(1, dtype=torch.int8, device=device)
 
+    def _get_state(pool_or_state):
+        """Extract LayerState from either a LayerSlotPool or a LayerState."""
+        if hasattr(pool_or_state, 'slots'):
+            return pool_or_state.slots[0]
+        return pool_or_state
+
     ptrs_to_free = set()
-    for layer_name, state in layer_states.items():
-        if not getattr(state, "supports_hybrid", False):
+    for layer_name, pool_or_state in layer_states.items():
+        if not getattr(_get_state(pool_or_state), "supports_hybrid", False):
             continue
         attn_module = static_ctx.get(layer_name)
         if attn_module is None:
@@ -243,8 +252,8 @@ def free_kv_cache(model_runner):
         if kv_list and len(kv_list) > 0 and hasattr(kv_list[0], "data_ptr"):
             ptrs_to_free.add(kv_list[0].data_ptr())
 
-    for layer_name, state in layer_states.items():
-        if not getattr(state, "supports_hybrid", False):
+    for layer_name, pool_or_state in layer_states.items():
+        if not getattr(_get_state(pool_or_state), "supports_hybrid", False):
             continue
         attn_module = static_ctx.get(layer_name)
         if attn_module is None:
