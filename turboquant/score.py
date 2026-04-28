@@ -106,7 +106,9 @@ def preallocate_layer(state, max_tokens: int):
 
     # CUDA-Graph-safe query conversion and output buffers
     state._q_f32_buf = torch.zeros(Q, D, device=dev, dtype=torch.float32)
-    state._out_bf16_buf = torch.zeros(1, Q, D, device=dev, dtype=torch.bfloat16)
+    # Output buffer matches model dtype (bf16 or fp16) — not hardcoded
+    model_dtype = state.engine.ring.dtype
+    state._out_buf = torch.zeros(1, Q, D, device=dev, dtype=model_dtype)
 
     # Pre-allocate ring buffer device tensors for CUDA-Graph-compatible writes
     state.engine.ring.preallocate_graph_buffers()
@@ -308,8 +310,8 @@ def _compressed_graph(query, flat, store, gqa_ratio, scale, layer_state):
     )
     # Graph-safe normalization + dtype cast (no allocation)
     acc.div_(l.unsqueeze(-1))  # in-place normalize
-    layer_state._out_bf16_buf[0].copy_(acc)  # f32→bf16 in-place
-    return layer_state._out_bf16_buf
+    layer_state._out_buf[0].copy_(acc)  # f32→bf16 in-place
+    return layer_state._out_buf
 
 
 def _hybrid_graph(query, flat, store, recent_k, recent_v,
@@ -376,8 +378,8 @@ def _hybrid_graph(query, flat, store, recent_k, recent_v,
             out_buf=layer_state._merge_out_buf,
         )
         # Graph-safe f32→bf16 output (no allocation)
-        layer_state._out_bf16_buf[0].copy_(out)
-        return layer_state._out_bf16_buf
+        layer_state._out_buf[0].copy_(out)
+        return layer_state._out_buf
 
     # Non-graph fallback: PyTorch for recent buffer + merge
     H_kv = num_kv_heads
@@ -398,8 +400,8 @@ def _hybrid_graph(query, flat, store, recent_k, recent_v,
     l_merged = l_c * alpha_c + l_r * alpha_r
     acc_merged = acc_c * alpha_c.unsqueeze(-1) + acc_r * alpha_r.unsqueeze(-1)
     out = acc_merged / l_merged.unsqueeze(-1)
-    layer_state._out_bf16_buf[0].copy_(out)
-    return layer_state._out_bf16_buf
+    layer_state._out_buf[0].copy_(out)
+    return layer_state._out_buf
 
 
 # ===================================================================
