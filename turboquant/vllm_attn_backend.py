@@ -50,6 +50,7 @@ def install_turboquant_hooks(
     initial_layers_key_bits: int | None = None,
     mode: str = MODE_ACCUMULATE,
     no_alloc: bool = False,
+    max_num_seqs: int = 1,
 ):
     global _GLOBAL_MODE
     new_mode = _LEGACY_TO_NEW.get(mode, _new_backend.MODE_CAPTURE_ONLY)
@@ -64,6 +65,7 @@ def install_turboquant_hooks(
         initial_layers_key_bits=initial_layers_key_bits,
         mode=new_mode,
         no_alloc=no_alloc,
+        max_num_seqs=max_num_seqs,
     )
 
     _GLOBAL_MODE = mode
@@ -80,15 +82,23 @@ def enable_no_alloc(
     value_bits: int = 2,
     buffer_size: int = 128,
     initial_layers_count: int = 4,
+    max_num_seqs: int = 1,
 ):
     """Call BEFORE creating vllm.LLM(). Patches the executor so TQ hooks
-    are installed automatically during engine initialization."""
+    are installed automatically during engine initialization.
+
+    Args:
+        max_num_seqs: Number of concurrent request slots to preallocate
+            per layer. Set to match vLLM's scheduler max_num_seqs for
+            full concurrent request support.
+    """
     global _TQ_NO_ALLOC_CONFIG
     _TQ_NO_ALLOC_CONFIG = dict(
         key_bits=key_bits,
         value_bits=value_bits,
         buffer_size=buffer_size,
         initial_layers_count=initial_layers_count,
+        max_num_seqs=max_num_seqs,
     )
 
     from vllm.v1.executor.abstract import Executor
@@ -142,6 +152,7 @@ def enable_no_alloc(
                 initial_layers_count=cfg["initial_layers_count"],
                 mode=MODE_ACTIVE,
                 no_alloc=True,
+                max_num_seqs=cfg.get("max_num_seqs", 1),
             )
 
             # Set up KV sharing so all flash layers share the first layer's
