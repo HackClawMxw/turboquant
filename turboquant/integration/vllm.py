@@ -760,12 +760,12 @@ def install_hooks(
                             st.engine._was_decoding = True
                             _transitions_seen += 1
 
-                            # Process deferred prefill KV.  Skip the FIRST
-                            # transition (during warmup/capture) — the data
-                            # is fake and the store will be reset on the
-                            # next real prefill anyway.
-                            if (_transitions_seen >= 2
-                                    and getattr(st, '_pending_prefill_kv', None) is not None):
+                            # Process deferred prefill KV.
+                            # In graph mode, warmup's fake KV is processed
+                            # first but gets cleared by reset() inside
+                            # ingest_prefill on the next real prefill
+                            # (because _was_decoding=True triggers reset).
+                            if getattr(st, '_pending_prefill_kv', None) is not None:
                                 k, v = st._pending_prefill_kv
                                 st.engine.ingest_prefill(k, v, k.shape[0])
                                 st._pending_prefill_kv = None
