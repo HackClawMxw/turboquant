@@ -118,13 +118,34 @@ class LayerSlotPool:
 
     Manages ``max_num_seqs`` independent LayerState instances so that
     concurrent requests don't share KV state.
+
+    Only slot 0 is created at startup.  Extra slots are created lazily
+    in ``allocate()`` when first needed, to avoid OOM from creating
+    all quantizers (rotation matrices) upfront.
     """
 
-    def __init__(self, slots: list[LayerState]):
-        self.slots = slots
+    def __init__(
+        self,
+        slot0: LayerState,
+        cfg: LayerConfig,
+        max_slots: int = 1,
+        no_alloc: bool = False,
+    ):
+        self.slots: list[LayerState] = [slot0]
         self._block_to_slot: dict[int, int] = {}  # first_block_idx -> slot_idx
-        self._free = list(range(len(slots)))
-        self._lazy_prealloc_tokens: int = 0  # max_tokens for lazy preallocation
+        self._free = [0]
+        self._max_slots = max_slots
+        self._cfg = cfg
+        self._no_alloc = no_alloc
+        self._lazy_prealloc_tokens: int = 0  # set by install_hooks
+
+    def _create_slot(self) -> int:
+        """Create a new LayerState on-demand and return its index."""
+        st = _create_layer_state(self._cfg)
+        st._no_alloc = self._no_alloc
+        idx = len(self.slots)
+        self.slots.append(st)
+        return idx
 
     def allocate(self, first_block: int) -> LayerState:
         """Allocate a slot for a new request. Returns LayerState."""
@@ -133,12 +154,19 @@ class LayerSlotPool:
             # Block reused from a finished request — reset stale data.
             self.slots[slot_idx].reset()
             return self.slots[slot_idx]
+
+        # Need a free slot — create one lazily if allowed.
         if not self._free:
-            # All slots occupied — evict the oldest (first-inserted) entry.
-            oldest_block = next(iter(self._block_to_slot))
-            evict_idx = self._block_to_slot.pop(oldest_block)
-            self.slots[evict_idx].reset()
-            self._free.append(evict_idx)
+            if len(self.slots) < self._max_slots:
+                idx = self._create_slot()
+                self._free.append(idx)
+            else:
+                # All slots occupied — evict the oldest (first-inserted) entry.
+                oldest_block = next(iter(self._block_to_slot))
+                evict_idx = self._block_to_slot.pop(oldest_block)
+                self.slots[evict_idx].reset()
+                self._free.append(evict_idx)
+
         slot_idx = self._free.pop(0)
         self._block_to_slot[first_block] = slot_idx
         # Lazy pre-allocate buffers for this slot on first use.
@@ -942,15 +970,14 @@ def install_hooks(
         state = _create_layer_state(cfg)
         state._no_alloc = no_alloc
 
-        # Create additional slots for concurrent request support.
-        # Slot 0 is the primary (just created above).
-        slots = [state]
-        for _slot_i in range(1, max_num_seqs):
-            extra = _create_layer_state(cfg)
-            extra._no_alloc = no_alloc
-            slots.append(extra)
-
-        pool = LayerSlotPool(slots)
+        # Only create slot 0 upfront.  Extra slots are created lazily
+        # in LayerSlotPool.allocate() when first needed.  This avoids
+        # OOM at startup — each extra slot's quantizer (rotation matrices,
+        # codebooks, etc.) is only allocated when a concurrent request
+        # actually needs it.
+        pool = LayerSlotPool(
+            slot0=state, cfg=cfg, max_slots=max_num_seqs, no_alloc=no_alloc,
+        )
         layer_pools[layer_name] = pool
 
         if backend_kind == "flash":
@@ -1154,8 +1181,8 @@ def install_hooks(
         logger.info("[TurboQuant] Patched model_runner.execute_model for overflow check")
 
     # Diagnostic init log
-    all_slots_flat = [s for p in layer_pools.values() for s in p.slots]
-    n_flash = sum(1 for s in all_slots_flat if s.config.backend_kind == "flash") // max_num_seqs
+    # Count distinct layers (slot 0 per pool), not total slots
+    n_flash = sum(1 for p in layer_pools.values() if p.slots[0].config.backend_kind == "flash")
     n_mla = len(layer_pools) - n_flash
     print(
         f"[TQ-INIT] layers={len(layer_pools)} flash={n_flash} mla={n_mla} "
