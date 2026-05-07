@@ -375,6 +375,9 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
             # query_start_loc: (num_reqs+1,) cumulative query token counts.
             _qsl = getattr(attn_metadata, 'query_start_loc', None)
             _nr = getattr(attn_metadata, 'num_reqs', None)
+            # Derive num_reqs from query_start_loc when not in metadata.
+            if _nr is None and _qsl is not None and len(_qsl) > 1:
+                _nr = len(_qsl) - 1
 
             if _pool is not None and _qsl is not None and _nr is not None and _nr > 0:
                 for si in range(_nr):
@@ -418,8 +421,8 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                 state._need_prefill_reset = True
 
             # Diagnostic: log capture path decisions.
-            # Only log for layer 0 and only during the first 3 steps to avoid spam.
-            if state.config.layer_idx == 0 and _diag["step"] < 3:
+            # Only log for layer 0 and only during the first 8 steps.
+            if state.config.layer_idx == 0 and _diag["step"] < 8:
                 _bt = _get_block_table(attn_metadata)
                 _path = ("per_req_qsl" if (_qsl is not None and _nr is not None)
                          else "decode" if is_decode
