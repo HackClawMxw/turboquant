@@ -417,6 +417,24 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                 )
                 state._need_prefill_reset = True
 
+            # Diagnostic: log capture path decisions (first 2 decode steps per layer)
+            if _diag["step"] < 2:
+                _bt = _get_block_table(attn_metadata)
+                _path = ("per_req_qsl" if (_qsl is not None and _nr is not None)
+                         else "decode" if is_decode
+                         else "direct_prefill" if not no_alloc
+                         else "deferred_prefill")
+                _slot_info = ""
+                if _pool is not None and _bt is not None:
+                    _slot_info = f" b2s={dict(_pool._block_to_slot)}"
+                print(
+                    f"[TQ-CAPTURE] layer={state.config.layer_idx} "
+                    f"path={_path} is_decode={is_decode} is_prefill={is_prefill} "
+                    f"num_tok={num_tok} qsl={_qsl is not None} nr={_nr} "
+                    f"no_alloc={no_alloc} pool={_pool is not None}{_slot_info}",
+                    flush=True,
+                )
+
         if should_log:
             torch.cuda.synchronize()
             t_after_capture = time.perf_counter()
@@ -1045,9 +1063,11 @@ def install_hooks(
     _orig_execute_model = getattr(model_runner, 'execute_model', None)
     if _orig_execute_model is not None and not getattr(model_runner, '_tq_execute_patched', False):
         def _make_tq_execute_hook(orig_fn, pools):
+            _hook_step = {"n": 0}
             def hooked(*args, **kwargs):
                 result = orig_fn(*args, **kwargs)
                 for _name, pool in pools.items():
+                    _b2s = dict(pool._block_to_slot)
                     for st in pool.active_slots():
                         ring = st.engine.ring
 
@@ -1068,6 +1088,15 @@ def install_hooks(
                                 st.engine.ingest_prefill(k, v, k.shape[0])
                                 st._pending_prefill_kv = None
 
+                                if _hook_step["n"] < 5:
+                                    print(
+                                        f"[TQ-HOOK] layer={st.config.layer_idx} "
+                                        f"processed deferred prefill tok={k.shape[0]} "
+                                        f"graph_mode={ring._graph_mode} "
+                                        f"pos={ring._pos} b2s={_b2s}",
+                                        flush=True,
+                                    )
+
                                 if ring._graph_mode and ring._pos >= ring.capacity:
                                     ring._pos = 0
                                     ring._pos_tensor.fill_(0)
@@ -1078,6 +1107,7 @@ def install_hooks(
                         if ring._graph_mode:
                             ring._cpu_decode_steps += 1
                             st.engine.check_overflow_and_compress()
+                _hook_step["n"] += 1
                 return result
             return hooked
 
