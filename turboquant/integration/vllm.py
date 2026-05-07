@@ -420,25 +420,35 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                 )
                 state._need_prefill_reset = True
 
-            # Diagnostic: log capture path decisions.
-            # Only log for layer 0 and only during the first 8 steps.
-            if state.config.layer_idx == 0 and _diag["step"] < 8:
-                _bt = _get_block_table(attn_metadata)
-                _path = ("per_req_qsl" if (_qsl is not None and _nr is not None)
-                         else "decode" if is_decode
-                         else "direct_prefill" if not no_alloc
-                         else "deferred_prefill")
-                _slot_info = ""
-                if _pool is not None and _bt is not None:
-                    _slot_info = f" b2s={dict(_pool._block_to_slot)}"
-                print(
-                    f"[TQ-CAPTURE] layer={state.config.layer_idx} "
-                    f"path={_path} is_decode={is_decode} is_prefill={is_prefill} "
-                    f"num_tok={num_tok} qsl={_qsl is not None} nr={_nr} "
-                    f"no_alloc={no_alloc} pool={_pool is not None}{_slot_info}",
-                    flush=True,
-                )
-                _diag["step"] += 1
+            # Diagnostic: log key state transitions on layer 0 only.
+            # Print on: prefill, nr change, or first 2 multi-req decode steps.
+            if state.config.layer_idx == 0:
+                _prev_nr = _diag.get("prev_nr", 0)
+                _do_print = False
+                if is_prefill:
+                    _do_print = True
+                elif _nr is not None and _nr != _prev_nr:
+                    _do_print = True
+                elif is_decode and _nr is not None and _nr > 1 and _diag.get("multi_dec", 0) < 2:
+                    _do_print = True
+                    _diag["multi_dec"] = _diag.get("multi_dec", 0) + 1
+                if _do_print:
+                    _bt = _get_block_table(attn_metadata)
+                    _path = ("per_req_qsl" if (_qsl is not None and _nr is not None)
+                             else "decode" if is_decode
+                             else "direct_prefill" if not no_alloc
+                             else "deferred_prefill")
+                    _slot_info = ""
+                    if _pool is not None and _bt is not None:
+                        _slot_info = f" b2s={dict(_pool._block_to_slot)}"
+                    print(
+                        f"[TQ-CAPTURE] layer={state.config.layer_idx} "
+                        f"path={_path} is_decode={is_decode} is_prefill={is_prefill} "
+                        f"num_tok={num_tok} qsl={_qsl is not None} nr={_nr} "
+                        f"no_alloc={no_alloc} pool={_pool is not None}{_slot_info}",
+                        flush=True,
+                    )
+                    _diag["prev_nr"] = _nr
 
         if should_log:
             torch.cuda.synchronize()
