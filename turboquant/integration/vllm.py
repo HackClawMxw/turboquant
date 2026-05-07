@@ -480,7 +480,9 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                     attn_metadata, output, output_scale, output_block_scale,
                 )
 
-            # Multi-sequence decode: compute per-sequence attention
+            # Multi-sequence decode: compute per-sequence attention.
+            # In CUDA Graph mode this only runs during single-token replay
+            # (T=1), so num_reqs will be > 1 only in eager mode.
             num_reqs = getattr(attn_metadata, 'num_reqs', None)
             if _pool is not None and num_reqs is not None and num_reqs > 1:
                 for si in range(num_reqs):
@@ -643,7 +645,8 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                     attn_metadata, output, output_scale, output_block_scale,
                 )
 
-            # Multi-sequence decode in no_alloc fallback
+            # Multi-sequence decode in no_alloc fallback.
+            # In CUDA Graph mode this only runs during single-token replay.
             num_reqs = getattr(attn_metadata, 'num_reqs', None)
             if _pool is not None and num_reqs is not None and num_reqs > 1:
                 for si in range(num_reqs):
