@@ -128,7 +128,13 @@ class LayerSlotPool:
     def allocate(self, first_block: int) -> LayerState:
         """Allocate a slot for a new request. Returns LayerState."""
         if first_block in self._block_to_slot:
-            return self.slots[self._block_to_slot[first_block]]
+            slot_idx = self._block_to_slot[first_block]
+            # Block reused from a finished request — reset stale data.
+            # When vLLM recycles physical blocks, a new request may get the
+            # same first block as a completed request.  Resetting ensures the
+            # new request starts with a clean store/ring buffer.
+            self.slots[slot_idx].reset()
+            return self.slots[slot_idx]
         if not self._free:
             # All slots occupied — evict the oldest (first-inserted) entry.
             # The evicted request must have finished by now since vLLM's
@@ -367,20 +373,14 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
             if is_decode or num_tok <= 1:
                 # Decode: capture into slots
                 if _pool is not None and num_tok > 1:
-                    # Multi-sequence decode: split by sequence
-                    num_reqs = getattr(attn_metadata, 'num_reqs', None)
-                    seq_lens = getattr(attn_metadata, 'seq_lens', None)
-                    if num_reqs is not None and seq_lens is not None:
-                        offset = 0
-                        for si in range(num_reqs):
-                            st = _resolve_slot_for_seq(attn_metadata, si)
-                            st.engine.ingest_decode(
-                                key[offset:offset+1], value[offset:offset+1], 1
-                            )
-                            offset += 1
-                    else:
-                        # Fallback: all tokens to primary slot
-                        state.engine.ingest_decode(key[:num_tok], value[:num_tok], num_tok)
+                    # Multi-sequence decode: each request contributes 1 token.
+                    # Route each token to its per-sequence slot to prevent
+                    # KV data crossing between concurrent requests.
+                    for si in range(num_tok):
+                        st = _resolve_slot_for_seq(attn_metadata, si)
+                        st.engine.ingest_decode(
+                            key[si:si+1], value[si:si+1], 1
+                        )
                 else:
                     # Single-token decode or single-state mode
                     state.engine.ingest_decode(key[:num_tok], value[:num_tok], num_tok)
@@ -477,7 +477,10 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
             # In CUDA Graph mode this only runs during single-token replay
             # (T=1), so num_reqs will be > 1 only in eager mode.
             num_reqs = getattr(attn_metadata, 'num_reqs', None)
-            if _pool is not None and num_reqs is not None and num_reqs > 1:
+            if num_reqs is None:
+                # Fallback: in pure decode each request contributes 1 token
+                num_reqs = q.shape[0]
+            if _pool is not None and num_reqs > 1:
                 for si in range(num_reqs):
                     st = _resolve_slot_for_seq(attn_metadata, si)
                     q_i = q[si:si+1]
@@ -641,7 +644,9 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
             # Multi-sequence decode in no_alloc fallback.
             # In CUDA Graph mode this only runs during single-token replay.
             num_reqs = getattr(attn_metadata, 'num_reqs', None)
-            if _pool is not None and num_reqs is not None and num_reqs > 1:
+            if num_reqs is None:
+                num_reqs = q_fb.shape[0]
+            if _pool is not None and num_reqs > 1:
                 for si in range(num_reqs):
                     st = _resolve_slot_for_seq(attn_metadata, si)
                     q_i = q_fb[si:si+1]
