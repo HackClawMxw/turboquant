@@ -417,8 +417,9 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                 )
                 state._need_prefill_reset = True
 
-            # Diagnostic: log capture path decisions (first 2 decode steps per layer)
-            if _diag["step"] < 2:
+            # Diagnostic: log capture path decisions.
+            # Only log for layer 0 and only during the first 3 steps to avoid spam.
+            if state.config.layer_idx == 0 and _diag["step"] < 3:
                 _bt = _get_block_table(attn_metadata)
                 _path = ("per_req_qsl" if (_qsl is not None and _nr is not None)
                          else "decode" if is_decode
@@ -434,6 +435,7 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                     f"no_alloc={no_alloc} pool={_pool is not None}{_slot_info}",
                     flush=True,
                 )
+                _diag["step"] += 1
 
         if should_log:
             torch.cuda.synchronize()
