@@ -124,28 +124,36 @@ class LayerSlotPool:
         self.slots = slots
         self._block_to_slot: dict[int, int] = {}  # first_block_idx -> slot_idx
         self._free = list(range(len(slots)))
+        self._lazy_prealloc_tokens: int = 0  # max_tokens for lazy preallocation
 
     def allocate(self, first_block: int) -> LayerState:
         """Allocate a slot for a new request. Returns LayerState."""
         if first_block in self._block_to_slot:
             slot_idx = self._block_to_slot[first_block]
             # Block reused from a finished request — reset stale data.
-            # When vLLM recycles physical blocks, a new request may get the
-            # same first block as a completed request.  Resetting ensures the
-            # new request starts with a clean store/ring buffer.
             self.slots[slot_idx].reset()
             return self.slots[slot_idx]
         if not self._free:
             # All slots occupied — evict the oldest (first-inserted) entry.
-            # The evicted request must have finished by now since vLLM's
-            # scheduler limits concurrent requests to max_num_seqs.
             oldest_block = next(iter(self._block_to_slot))
             evict_idx = self._block_to_slot.pop(oldest_block)
             self.slots[evict_idx].reset()
             self._free.append(evict_idx)
         slot_idx = self._free.pop(0)
         self._block_to_slot[first_block] = slot_idx
-        return self.slots[slot_idx]
+        # Lazy pre-allocate buffers for this slot on first use.
+        # Slot 0 is pre-allocated in install_hooks; extra slots are
+        # pre-allocated here to avoid OOM at startup.
+        st = self.slots[slot_idx]
+        if st.supports_hybrid and not st.store.is_preallocated and self._lazy_prealloc_tokens > 0:
+            from turboquant.score import preallocate_layer
+            try:
+                preallocate_layer(st, self._lazy_prealloc_tokens)
+            except Exception as e:
+                logger.warning(
+                    "[TurboQuant] Lazy preallocation failed for slot %d: %s", slot_idx, e,
+                )
+        return st
 
     def get(self, first_block: int) -> LayerState:
         """Get the slot for an existing request."""
@@ -1045,14 +1053,19 @@ def install_hooks(
 
     if max_tokens > 0:
         for name, pool in layer_pools.items():
-            for slot in pool.slots:
-                if slot.supports_hybrid:
-                    try:
-                        preallocate_layer(slot, max_tokens)
-                    except Exception as e:
-                        logger.warning(
-                            "[TurboQuant] Pre-allocation failed for %s slot: %s", name, e
-                        )
+            # Store max_tokens for lazy preallocation of extra slots.
+            pool._lazy_prealloc_tokens = max_tokens
+            # Only pre-allocate slot 0 at startup to avoid OOM.
+            # Extra slots are lazily pre-allocated in LayerSlotPool.allocate()
+            # when they are first assigned to a request.
+            slot0 = pool.slots[0]
+            if slot0.supports_hybrid:
+                try:
+                    preallocate_layer(slot0, max_tokens)
+                except Exception as e:
+                    logger.warning(
+                        "[TurboQuant] Pre-allocation failed for %s slot 0: %s", name, e
+                    )
     else:
         if no_alloc:
             logger.error(
