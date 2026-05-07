@@ -370,22 +370,44 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                 and attn_metadata is not None):
             num_tok = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
 
-            if is_decode or num_tok <= 1:
-                # Decode: capture into slots
+            # Per-request KV capture using query_start_loc.
+            # Handles pure prefill, pure decode, and mixed batches correctly.
+            # query_start_loc: (num_reqs+1,) cumulative query token counts.
+            _qsl = getattr(attn_metadata, 'query_start_loc', None)
+            _nr = getattr(attn_metadata, 'num_reqs', None)
+
+            if _pool is not None and _qsl is not None and _nr is not None and _nr > 0:
+                for si in range(_nr):
+                    start = int(_qsl[si])
+                    end = int(_qsl[si + 1])
+                    qlen = end - start
+                    st = _resolve_slot_for_seq(attn_metadata, si)
+                    if qlen > 1:
+                        st.engine.ingest_prefill(
+                            key[start:end], value[start:end], qlen
+                        )
+                    elif qlen == 1:
+                        st.engine.ingest_decode(
+                            key[start:end], value[start:end], 1
+                        )
+            elif is_decode or num_tok <= 1:
+                # Fallback (no query_start_loc): pure decode path
                 if _pool is not None and num_tok > 1:
-                    # Multi-sequence decode: each request contributes 1 token.
-                    # Route each token to its per-sequence slot to prevent
-                    # KV data crossing between concurrent requests.
                     for si in range(num_tok):
                         st = _resolve_slot_for_seq(attn_metadata, si)
                         st.engine.ingest_decode(
                             key[si:si+1], value[si:si+1], 1
                         )
                 else:
-                    # Single-token decode or single-state mode
                     state.engine.ingest_decode(key[:num_tok], value[:num_tok], num_tok)
-            elif not _graph_intended:
-                # Prefill in eager mode: capture directly
+            elif not no_alloc:
+                # Eager mode (no_alloc=False): capture prefill directly.
+                # NOTE: do NOT use _graph_intended here — it is True whenever
+                # the store is preallocated, even in eager mode.  Using it
+                # would defer the prefill to the execute_model hook, but the
+                # hook only processes deferred prefill when ring._graph_mode
+                # is True (which it isn't in eager mode), so the prefill
+                # would be silently dropped.
                 _capture_kv_for_slot(state, key, value, attn_metadata, False)
             else:
                 # Graph-intended: defer prefill to execute_model hook
@@ -1028,36 +1050,33 @@ def install_hooks(
                 for _name, pool in pools.items():
                     for st in pool.active_slots():
                         ring = st.engine.ring
-                        if ring._graph_mode:
-                            ring._cpu_decode_steps += 1
 
-                            # Handle prefill-reset signal from patched forward.
-                            if getattr(st, '_need_prefill_reset', False):
-                                st.engine._was_decoding = False
-                                st._need_prefill_reset = False
+                        # Process deferred prefill regardless of graph mode.
+                        # In eager mode, _graph_intended may be True (because
+                        # the store is preallocated), causing patched forward
+                        # to defer prefill.  Without this, the deferred prefill
+                        # would be silently dropped in eager mode.
+                        if getattr(st, '_need_prefill_reset', False):
+                            st.engine._was_decoding = False
+                            st._need_prefill_reset = False
 
-                            if not st.engine._was_decoding:
-                                # Prefill-to-decode transition.
-                                st.engine._was_decoding = True
+                        if not st.engine._was_decoding:
+                            st.engine._was_decoding = True
 
-                                # Process deferred prefill KV.
-                                if getattr(st, '_pending_prefill_kv', None) is not None:
-                                    k, v = st._pending_prefill_kv
-                                    st.engine.ingest_prefill(k, v, k.shape[0])
-                                    st._pending_prefill_kv = None
+                            if getattr(st, '_pending_prefill_kv', None) is not None:
+                                k, v = st._pending_prefill_kv
+                                st.engine.ingest_prefill(k, v, k.shape[0])
+                                st._pending_prefill_kv = None
 
-                                    # After ingest_prefill fills the ring buffer,
-                                    # _pos_tensor may equal capacity, causing an
-                                    # out-of-bounds write on the next graph replay
-                                    # (index_copy_ with index == tensor size).
-                                    # Wrap position to 0 and reset the warmup-
-                                    # contaminated decode step counter.
-                                    if ring._pos >= ring.capacity:
-                                        ring._pos = 0
-                                        ring._pos_tensor.fill_(0)
-                                        ring._count_tensor.fill_(ring.capacity)
+                                if ring._graph_mode and ring._pos >= ring.capacity:
+                                    ring._pos = 0
+                                    ring._pos_tensor.fill_(0)
+                                    ring._count_tensor.fill_(ring.capacity)
+                                if ring._graph_mode:
                                     ring._cpu_decode_steps = 0
 
+                        if ring._graph_mode:
+                            ring._cpu_decode_steps += 1
                             st.engine.check_overflow_and_compress()
                 return result
             return hooked
