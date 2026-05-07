@@ -82,15 +82,17 @@ def enable_no_alloc(
     value_bits: int = 2,
     buffer_size: int = 128,
     initial_layers_count: int = 4,
-    max_num_seqs: int = 1,
+    max_num_seqs: int = 0,
 ):
     """Call BEFORE creating vllm.LLM(). Patches the executor so TQ hooks
     are installed automatically during engine initialization.
 
     Args:
         max_num_seqs: Number of concurrent request slots to preallocate
-            per layer. Set to match vLLM's scheduler max_num_seqs for
-            full concurrent request support.
+            per layer. 0 = auto-detect from vLLM scheduler config.
+            Must be >= the number of concurrent requests you expect,
+            otherwise slots will be evicted mid-request causing KV data
+            corruption between requests.
     """
     global _TQ_NO_ALLOC_CONFIG
     _TQ_NO_ALLOC_CONFIG = dict(
@@ -144,6 +146,18 @@ def enable_no_alloc(
             from turboquant.vllm_attn_backend import (
                 install_turboquant_hooks, MODE_ACTIVE
             )
+            # Auto-detect max_num_seqs from scheduler config if not set.
+            mns = cfg.get("max_num_seqs", 1)
+            if mns <= 0:
+                sc = getattr(worker.model_runner, 'scheduler_config', None)
+                if sc is not None:
+                    mns = getattr(sc, 'max_num_seqs', 1)
+                else:
+                    mns = 1
+                logger.info(
+                    "[TurboQuant] Auto-detected max_num_seqs=%d from scheduler config",
+                    mns,
+                )
             tq_states = install_turboquant_hooks(
                 worker.model_runner,
                 key_bits=cfg["key_bits"],
@@ -152,7 +166,7 @@ def enable_no_alloc(
                 initial_layers_count=cfg["initial_layers_count"],
                 mode=MODE_ACTIVE,
                 no_alloc=True,
-                max_num_seqs=cfg.get("max_num_seqs", 1),
+                max_num_seqs=mns,
             )
 
             # Set up KV sharing so all flash layers share the first layer's

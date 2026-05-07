@@ -997,11 +997,19 @@ def install_hooks(
     )
 
     if no_alloc and max_num_seqs > 1:
+        logger.info(
+            "[TurboQuant] no_alloc=True with max_num_seqs=%d: "
+            "CUDA Graph does NOT support per-request KV isolation. "
+            "Use enforce_eager=True for correct multi-request support.",
+            max_num_seqs,
+        )
+
+    if max_num_seqs < 2:
         logger.warning(
-            "[TurboQuant] no_alloc=True with max_num_seqs=%d: CUDA Graph does "
-            "NOT support per-request KV isolation.  Concurrent requests will "
-            "share KV state and produce incorrect output.  Use max_num_seqs=1 "
-            "for graph mode, or set no_alloc=False for multi-request eager mode.",
+            "[TurboQuant] max_num_seqs=%d: only 1 slot per layer. "
+            "Concurrent requests will evict each other's KV data. "
+            "Set max_num_seqs >= expected concurrent requests "
+            "(or use default 0 for auto-detect from vLLM scheduler).",
             max_num_seqs,
         )
 
