@@ -262,16 +262,9 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
     if isinstance(pool_or_state, LayerSlotPool):
         _pool = pool_or_state
         _single_state = None
-        _primary_state = _pool.slots[0]
     else:
         _pool = None
         _single_state = pool_or_state
-        _primary_state = pool_or_state
-
-    # CUDA Graph mode: the graph is captured with slot 0's tensor addresses
-    # and replay always operates on those same tensors.  Per-slot routing
-    # must be bypassed — all operations go through the primary slot.
-    _force_primary = no_alloc and _pool is not None
 
     # Diagnostic: track decode step count per-layer, only log first N
     _diag = {"step": 0}
@@ -315,10 +308,19 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                 return _pool.allocate(first_block)
 
     def _resolve_slot_for_seq(attn_metadata, seq_idx):
-        """Resolve the LayerState for a specific decode sequence."""
+        """Resolve the LayerState for a specific decode sequence.
+
+        In CUDA Graph mode, the graph binds to tensor addresses during
+        warmup.  Position i must map to slot i so that replay uses the
+        correct per-slot tensors.  When block_table is unavailable
+        (warmup / graph capture), we assign by position index directly.
+        """
         block_table = _get_block_table(attn_metadata)
         if block_table is None:
-            return _pool.slots[0]
+            # Warmup or missing block table: assign by position index.
+            # This is critical for CUDA Graph — position i → slot i ensures
+            # the graph captures per-slot operations for each decode token.
+            return _pool.slots[min(seq_idx, len(_pool.slots) - 1)]
         first_block = int(block_table[seq_idx, 0])
         try:
             return _pool.get(first_block)
@@ -344,11 +346,7 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                       and getattr(attn_metadata, 'max_query_len', 0) > 1)
 
         # Resolve the primary slot for this request.
-        # In CUDA Graph mode, always use slot 0 — the graph is bound to its
-        # tensor addresses during capture, and replay cannot switch slots.
-        if _force_primary:
-            state = _primary_state
-        elif _pool is not None:
+        if _pool is not None:
             state = _resolve_slot(attn_metadata, is_prefill)
         else:
             state = _single_state
@@ -367,15 +365,14 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
             num_tok = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
 
             if is_decode or num_tok <= 1:
-                # Decode: capture into slots
-                if _force_primary:
-                    # Graph mode: all tokens go to the primary slot
-                    state.engine.ingest_decode(key[:num_tok], value[:num_tok], num_tok)
-                elif _pool is not None and num_tok > 1:
-                    # Eager mode multi-sequence decode: split by sequence
+                # Decode: capture into slots.
+                # Multi-token decode splits by sequence — each sequence's
+                # KV goes to its own slot.  This is critical for CUDA Graph
+                # warmup where position i must map to slot i.
+                if _pool is not None and num_tok > 1:
                     num_reqs = getattr(attn_metadata, 'num_reqs', None)
                     seq_lens = getattr(attn_metadata, 'seq_lens', None)
-                    if num_reqs is not None and seq_lens is not None:
+                    if num_reqs is not None and num_reqs > 0:
                         offset = 0
                         for si in range(num_reqs):
                             st = _resolve_slot_for_seq(attn_metadata, si)
@@ -384,8 +381,13 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                             )
                             offset += 1
                     else:
-                        # Fallback: all tokens to primary slot
-                        state.engine.ingest_decode(key[:num_tok], value[:num_tok], num_tok)
+                        # Fallback: route each token to its position's slot.
+                        # This ensures CUDA Graph warmup captures per-slot ops.
+                        for si in range(num_tok):
+                            st = _resolve_slot_for_seq(attn_metadata, si)
+                            st.engine.ingest_decode(
+                                key[si:si+1], value[si:si+1], 1
+                            )
                 else:
                     # Single-token decode or single-state mode
                     state.engine.ingest_decode(key[:num_tok], value[:num_tok], num_tok)
@@ -480,13 +482,7 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
 
             # Multi-sequence decode: compute per-sequence attention
             num_reqs = getattr(attn_metadata, 'num_reqs', None)
-            if _force_primary:
-                # Graph mode: skip per-sequence routing, fall through to
-                # single-sequence path using the primary slot.  All tokens
-                # in the batch belong to the graph-bound slot.
-                pass
-            elif _pool is not None and num_reqs is not None and num_reqs > 1:
-                # Eager mode: Per-sequence hybrid attention
+            if _pool is not None and num_reqs is not None and num_reqs > 1:
                 for si in range(num_reqs):
                     st = _resolve_slot_for_seq(attn_metadata, si)
                     q_i = q[si:si+1]
@@ -649,11 +645,7 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
 
             # Multi-sequence decode in no_alloc fallback
             num_reqs = getattr(attn_metadata, 'num_reqs', None)
-            if _force_primary:
-                # Graph mode: skip per-sequence routing, fall through to
-                # single-sequence path using the primary slot.
-                pass
-            elif _pool is not None and num_reqs is not None and num_reqs > 1:
+            if _pool is not None and num_reqs is not None and num_reqs > 1:
                 for si in range(num_reqs):
                     st = _resolve_slot_for_seq(attn_metadata, si)
                     q_i = q_fb[si:si+1]
@@ -949,12 +941,10 @@ def install_hooks(
     )
 
     if no_alloc and max_num_seqs > 1:
-        logger.warning(
-            "[TurboQuant] no_alloc=True with max_num_seqs=%d: CUDA Graph mode "
-            "binds to a single set of tensor addresses and cannot isolate "
-            "per-request state.  All concurrent requests will share slot 0.  "
-            "For true multi-request isolation, set no_alloc=False (eager mode) "
-            "or use max_num_seqs=1.",
+        logger.info(
+            "[TurboQuant] no_alloc=True with max_num_seqs=%d: using position-based "
+            "slot mapping (position i → slot i) for CUDA Graph compatibility.  "
+            "Each concurrent request gets its own isolated KV state.",
             max_num_seqs,
         )
 
@@ -1034,14 +1024,14 @@ def install_hooks(
             def hooked(*args, **kwargs):
                 result = orig_fn(*args, **kwargs)
                 for _name, pool in pools.items():
-                    # In CUDA Graph mode (no_alloc), only process the primary
-                    # slot — the graph is bound to slot 0's tensor addresses
-                    # and replay only writes to / reads from those tensors.
-                    # Processing other active slots would cause phantom
-                    # _cpu_decode_steps increments and wrong compression timing.
+                    # In CUDA Graph mode (no_alloc), process ALL position-
+                    # mapped slots.  During graph capture, position i maps to
+                    # slot i.  During replay, the graph writes each position's
+                    # KV to its own slot's ring buffer.  We must process all
+                    # slots to handle overflow and transitions correctly.
                     primary = pool.slots[0]
                     if primary._no_alloc:
-                        slots_to_process = [primary]
+                        slots_to_process = list(pool.slots)
                     else:
                         slots_to_process = pool.active_slots()
 
