@@ -289,6 +289,122 @@ def _no_alloc_prefill_attention(
     return out.squeeze(0).transpose(0, 1)
 
 
+def _get_ring_kv(st):
+    """Get recent K/V from ring buffer, regardless of graph mode."""
+    if st.engine.ring.graph_ready:
+        return st.engine.ring._k, st.engine.ring._v
+    recent = st.engine.ring.peek()
+    if recent is not None:
+        return recent[0], recent[1]
+    return None, None
+
+
+def _resolve_slot_from_pool(pool, attn_metadata, seq_idx, is_prefill):
+    """Resolve a LayerState from pool + metadata (module-level helper)."""
+    block_table = _get_block_table(attn_metadata)
+    if block_table is None:
+        return pool.slots[min(seq_idx, len(pool.slots) - 1)]
+    first_block = int(block_table[seq_idx, 0])
+    if is_prefill:
+        return pool.allocate(first_block)
+    try:
+        return pool.get(first_block)
+    except KeyError:
+        return pool.allocate(first_block)
+
+
+def _handle_mixed_batch(
+    self_impl, query, key, value, attn_metadata,
+    output, pool, primary_state, qsl, nr,
+):
+    """Handle a mixed prefill+decode batch by computing per-request attention.
+
+    In a mixed batch, some requests are prefilling (qlen > 1) while others
+    are decoding (qlen == 1).  We cannot use a single causal SDPA because:
+      - Prefill requests need self-attention within their own tokens
+      - Decode requests need attention against their compressed KV history
+    So we iterate per-request and compute the correct attention for each.
+    """
+    num_actual = attn_metadata.num_actual_tokens
+    q = query[:num_actual]
+    k = key[:num_actual]
+    v = value[:num_actual]
+    head_dim = primary_state.config.head_dim
+    num_query_heads = primary_state.config.num_query_heads
+    num_kv_heads = primary_state.config.num_kv_heads
+
+    if q.dim() == 2:
+        q = q.view(num_actual, num_query_heads, head_dim)
+    if k.dim() == 2:
+        k = k.view(num_actual, num_kv_heads, head_dim)
+        v = v.view(num_actual, num_kv_heads, head_dim)
+
+    scale = getattr(self_impl, "scale", 1.0 / math.sqrt(head_dim))
+
+    for si in range(nr):
+        start = int(qsl[si])
+        end = int(qsl[si + 1])
+        qlen = end - start
+        st = _resolve_slot_from_pool(pool, attn_metadata, si, is_prefill=(qlen > 1))
+
+        if qlen > 1:
+            # Prefill request: causal self-attention within this request's tokens
+            q_i = q[start:end]
+            k_i = k[start:end]
+            v_i = v[start:end]
+
+            if num_query_heads != num_kv_heads:
+                repeats = num_query_heads // num_kv_heads
+                k_i = k_i.repeat_interleave(repeats, dim=1)
+                v_i = v_i.repeat_interleave(repeats, dim=1)
+
+            q_t = q_i.unsqueeze(0).transpose(1, 2)
+            k_t = k_i.unsqueeze(0).transpose(1, 2)
+            v_t = v_i.unsqueeze(0).transpose(1, 2)
+            result_i = F.scaled_dot_product_attention(
+                q_t, k_t, v_t, is_causal=True, scale=scale,
+            ).squeeze(0).transpose(0, 1)
+        else:
+            # Decode request: hybrid attention with compressed KV history
+            q_i = q[start:end]
+            flat = st.store.get_flat_cache()
+
+            recent_k, recent_v = _get_ring_kv(st)
+            has_history = flat is not None and (
+                st.store.is_preallocated or flat.num_tokens >= MIN_HISTORY_FOR_TQ
+            )
+            has_recent = recent_k is not None and recent_k.shape[0] > 0
+
+            if has_history or has_recent:
+                result_i = compute_hybrid_attention(
+                    query=q_i,
+                    store=st.store,
+                    recent_k=recent_k,
+                    recent_v=recent_v,
+                    num_query_heads=num_query_heads,
+                    scale=scale,
+                    layer_state=st,
+                )
+            else:
+                result_i = torch.zeros(
+                    1, num_query_heads, head_dim,
+                    device=q_i.device, dtype=q_i.dtype,
+                )
+
+        # Write result to output tensor
+        result_flat_i = result_i.reshape(qlen, num_query_heads * head_dim)
+        if output is not None:
+            out_slice_i = output[start:end]
+            if out_slice_i.dim() == 3:
+                out_slice_i.copy_(result_i)
+            else:
+                out_slice_i.copy_(result_flat_i)
+
+    if output is not None:
+        return output
+    return output
+
+
 def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                           capture_in_forward: bool = False):
     """Intercept forward to optionally use TQ decode.
@@ -516,6 +632,31 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
             )
 
         if is_prefill:
+            # Detect mixed prefill+decode batch: when max_query_len > 1 (prefill
+            # present) but some requests have qlen == 1 (decode).  In this case
+            # we cannot use a single prefill SDPA — each request needs its own
+            # attention computation.
+            _qsl_m = getattr(attn_metadata, 'query_start_loc', None)
+            _nr_m = getattr(attn_metadata, 'num_reqs', None)
+            if _nr_m is None and _qsl_m is not None and len(_qsl_m) > 1:
+                _nr_m = len(_qsl_m) - 1
+            _has_decode_req = False
+            _has_prefill_req = False
+            if _qsl_m is not None and _nr_m is not None and _nr_m > 1:
+                for _si in range(_nr_m):
+                    _qlen = int(_qsl_m[_si + 1]) - int(_qsl_m[_si])
+                    if _qlen > 1:
+                        _has_prefill_req = True
+                    else:
+                        _has_decode_req = True
+
+            if no_alloc and _has_decode_req and _has_prefill_req:
+                # Mixed batch: handle each request independently.
+                return _handle_mixed_batch(
+                    self_impl, query, key, value, attn_metadata,
+                    output, _pool, state, _qsl_m, _nr_m,
+                )
+
             if no_alloc:
                 result = _no_alloc_prefill_attention(
                     state, self_impl, query, key, value, attn_metadata
