@@ -365,14 +365,12 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
             num_tok = getattr(attn_metadata, 'num_actual_tokens', key.shape[0])
 
             if is_decode or num_tok <= 1:
-                # Decode: capture into slots.
-                # Multi-token decode splits by sequence — each sequence's
-                # KV goes to its own slot.  This is critical for CUDA Graph
-                # warmup where position i must map to slot i.
+                # Decode: capture into slots
                 if _pool is not None and num_tok > 1:
+                    # Multi-sequence decode: split by sequence
                     num_reqs = getattr(attn_metadata, 'num_reqs', None)
                     seq_lens = getattr(attn_metadata, 'seq_lens', None)
-                    if num_reqs is not None and num_reqs > 0:
+                    if num_reqs is not None and seq_lens is not None:
                         offset = 0
                         for si in range(num_reqs):
                             st = _resolve_slot_for_seq(attn_metadata, si)
@@ -381,13 +379,8 @@ def _make_patched_forward(orig_fn, pool_or_state, no_alloc: bool = False,
                             )
                             offset += 1
                     else:
-                        # Fallback: route each token to its position's slot.
-                        # This ensures CUDA Graph warmup captures per-slot ops.
-                        for si in range(num_tok):
-                            st = _resolve_slot_for_seq(attn_metadata, si)
-                            st.engine.ingest_decode(
-                                key[si:si+1], value[si:si+1], 1
-                            )
+                        # Fallback: all tokens to primary slot
+                        state.engine.ingest_decode(key[:num_tok], value[:num_tok], num_tok)
                 else:
                     # Single-token decode or single-state mode
                     state.engine.ingest_decode(key[:num_tok], value[:num_tok], num_tok)
@@ -944,10 +937,11 @@ def install_hooks(
     )
 
     if no_alloc and max_num_seqs > 1:
-        logger.info(
-            "[TurboQuant] no_alloc=True with max_num_seqs=%d: using position-based "
-            "slot mapping (position i → slot i) for CUDA Graph compatibility.  "
-            "Each concurrent request gets its own isolated KV state.",
+        logger.warning(
+            "[TurboQuant] no_alloc=True with max_num_seqs=%d: CUDA Graph does "
+            "NOT support per-request KV isolation.  Concurrent requests will "
+            "share KV state and produce incorrect output.  Use max_num_seqs=1 "
+            "for graph mode, or set no_alloc=False for multi-request eager mode.",
             max_num_seqs,
         )
 
@@ -1027,18 +1021,7 @@ def install_hooks(
             def hooked(*args, **kwargs):
                 result = orig_fn(*args, **kwargs)
                 for _name, pool in pools.items():
-                    # In CUDA Graph mode (no_alloc), process ALL position-
-                    # mapped slots.  During graph capture, position i maps to
-                    # slot i.  During replay, the graph writes each position's
-                    # KV to its own slot's ring buffer.  We must process all
-                    # slots to handle overflow and transitions correctly.
-                    primary = pool.slots[0]
-                    if primary._no_alloc:
-                        slots_to_process = list(pool.slots)
-                    else:
-                        slots_to_process = pool.active_slots()
-
-                    for st in slots_to_process:
+                    for st in pool.active_slots():
                         ring = st.engine.ring
                         if ring._graph_mode:
                             ring._cpu_decode_steps += 1
